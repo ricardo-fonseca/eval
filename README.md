@@ -15,4 +15,4 @@ The toolkit was initially developed for use in the "Operating Systems" course un
 
 ## Documentation
 
-Full documentation is available [here](eval.md). The source code is also heavily documented.
+Full documentation, including compilation instructions, is available [here](eval.md). The source code is also fully documented.

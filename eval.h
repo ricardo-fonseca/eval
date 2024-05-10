@@ -154,6 +154,8 @@ void _eval_disarm_signals( void );
 
 int eval_checkptr( void* ptr );
 
+int eval_checkconstptr( const void* ptr );
+
 
 typedef struct {
     int stdin;
@@ -180,10 +182,17 @@ enum EVAL_CATCH_CODES {
     EVAL_CATCH_LOG_OVERFLOW
 };
 
-enum EVAL_ACTION {
-    EVAL_PROTECT = -2,
-    EVAL_BLOCK = -1,
-    EVAL_DEFAULT = 0
+enum ACTION_CODES {
+    ACTION_PROTECT = -2,
+    ACTION_BLOCK   = -1,
+    ACTION_DEFAULT = 0,
+    ACTION_SUCCESS,
+    ACTION_LOG,
+    ACTION_ERROR,
+    ACTION_WARN,
+    ACTION_CREATE,
+    ACTION_RETRY,
+    ACTION_INJECT
 };
 
 #ifdef _EVAL_DEBUG
@@ -891,6 +900,7 @@ int _eval_fclose(FILE* stream);
 typedef struct {
     int action;
     int status;
+    char path[ PATH_MAX ];
     int ret;
 } _eval_execl_type;
 

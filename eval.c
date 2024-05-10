@@ -715,6 +715,7 @@ struct {
     int stat;
     int sig;
     jmp_buf jmp;
+    char buffer;
 }_eval_checkptr_data;
 
 /**
@@ -778,8 +779,86 @@ int eval_checkptr( void* ptr ) {
     int stat = sigsetjmp( _eval_checkptr_data.jmp, 1 );
     if ( !stat ) {
         char *p = (char *) ptr;
-        char b = *p;
-        *p = b;
+        _eval_checkptr_data.buffer = *p;
+        *p = _eval_checkptr_data.buffer;
+    }
+
+    // Restore previous signal handlers
+    if ( sigaction( SIGSEGV, &tmp[0], NULL ) < 0 ) {
+        perror("eval_checkptr: (*critical*) Unable to reset SIGSEGV handler");
+        exit(1);
+    };
+
+    if ( sigaction( SIGBUS, &tmp[0], NULL ) < 0 ) {
+        perror("eval_checkptr: (*critical*) Unable to reset SIGBUS handler");
+        exit(1);
+    };
+
+    if ( _eval_checkptr_data.stat ) {
+        switch( _eval_checkptr_data.sig ) {
+        case(SIGSEGV):
+            eval_error("(checkptr) Accessing %p caused Segmentation Fault", ptr);
+            return 3;
+        case(SIGBUS):
+            eval_error("(checkptr) Accessing %p caused Bus Error", ptr);
+            return 4;
+        default:
+            eval_error("(checkptr) Accessing %p caused unknonown signal", ptr);
+            return 5;
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * Checks if a pointer is valid by reading 1 byte from address
+ * @param ptr   Pointer to be evaluated
+ * @return      0 is pointer is valid
+ *              1 NULL pointer
+ *              2 (-1) pointer
+ *              3 Segmentation fault when accessing pointer
+ *              4 Bus Error when accessing pointer
+ *              5 Invalid signal caught (should never happen)
+ */
+int eval_checkconstptr( const void * ptr ) {
+
+    if ( ptr == NULL ) {
+        eval_error("NULL pointer");
+        return 1;
+    }
+
+    if ( ptr == (void *) -1 ) {
+        eval_error("Invalid pointer %p", ptr );
+        return 2;
+    }
+
+    // Catch SIGSEGV and SIGBUS
+    struct sigaction act = {
+        .sa_flags = SA_SIGINFO | SA_RESTART,
+        .sa_sigaction = _eval_checkptr_sighndlr
+    };
+    struct sigaction tmp[2];
+
+    if ( sigaction( SIGSEGV, &act, &tmp[0] ) < 0 ) {
+        perror("eval_checkptr: (*critical*) Unable to set SIGSEGV handler");
+        exit(1);
+    };
+
+    if ( sigaction( SIGBUS, &act, &tmp[1] ) < 0 ) {
+        perror("eval_checkptr: (*critical*) Unable to set SIGBUS handler");
+        exit(1);
+    };
+
+    // Reset _eval_checkptr_data
+    _eval_checkptr_data.stat = 0;
+    _eval_checkptr_data.sig = -1;
+
+    // Access memory at position ptr, invalid pointers will throw a signal
+    int stat = sigsetjmp( _eval_checkptr_data.jmp, 1 );
+    if ( !stat ) {
+        char *p = (char *) ptr;
+        _eval_checkptr_data.buffer = *p;
     }
 
     // Restore previous signal handlers
@@ -1137,7 +1216,7 @@ EVAL_VAR(exit);
  */
 void _eval_exit( int status ) {
     _eval_exit_data.status = status;
-    if ( _eval_exit_data.action )
+    if ( _eval_exit_data.action == ACTION_WARN )
          eval_info("exit(%d) caught!", status );
     
     siglongjmp(_eval_env.jmp, EVAL_CATCH_EXIT);
@@ -1166,7 +1245,7 @@ EVAL_VAR(abort);
  */
 void _eval_abort( void ) {
     _eval_abort_data.status = 1;
-    if ( _eval_abort_data.action )
+    if ( _eval_abort_data.action == ACTION_WARN )
          eval_info("abort() caught!" );
     
     siglongjmp(_eval_env.jmp, EVAL_CATCH_ABORT);
@@ -1182,9 +1261,11 @@ EVAL_VAR(sleep);
  * @brief Evaluate implementation calling of sleep function
  * Requires data in global _eval_sleep_data
  * 
- * Behavior:
- *   .action = 1    Return 0 immediately without calling sleep()
- *   default        call sleep(seconds)
+ * .action behavior:
+ *   ACTION_ERROR       (interrupted by signal) Return 1
+ *   ACTION_LOG         (log) Log function call and proceed with ACTION_SUCCESS
+ *   ACTION_SUCCESS     (success) Return 0
+ *   ACTION_DEFAULT     call sleep(seconds)
  * 
  * @param seconds   Number of seconds to sleep
  * @return          Evalation result or result of sleep operation
@@ -1193,10 +1274,15 @@ unsigned int _eval_sleep(unsigned int seconds) {
     _eval_sleep_data.status ++;
     _eval_sleep_data.seconds = seconds;
     switch( _eval_sleep_data.action ) {
-    case(1):
+    case(ACTION_ERROR): // Interrupted by signal
+        _eval_sleep_data.ret = 1;
+        break;
+    case(ACTION_LOG):
+        datalog("sleep,%d", seconds );
+    case(ACTION_SUCCESS): // success (finished sleep)
         _eval_sleep_data.ret = 0;
         break;
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("sleep() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
@@ -1216,32 +1302,33 @@ EVAL_VAR(fork);
  * @brief Evaluate implementation calling of fork function
  * Requires data in global _eval_fork_data
  * 
- * Behavior:
- *   .action = 3    Return -1 immediately without calling fork()
- *   .action = 2    Return 1 immediately without calling fork()
- *   .action = 1    Return 0 immediately without calling fork()
- *   default        call fork()
+ * .action behavior:
+ * + `ACTION_ERROR`   - (error) Return -1
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`
+ * + `ACTION_SUCCESS` - (success) Return value previously set in `_eval_fork_data.ret`.
+ *                      If the value was less than 0 it is set to 0. If we want the 
+ *                      command to behave as if it returns in the parent process, we 
+ *                      should set this to a value `>= 1`.
+ * + `ACTION_DEFAULT` - Capture parameters and call `fork()`
  * 
  * @return          Evalation result or result of fork operation
  */
 pid_t _eval_fork(void) {
     _eval_fork_data.status ++;
     switch( _eval_fork_data.action ) {
-    case(3):
+    case(ACTION_ERROR): // error
         _eval_fork_data.ret = -1;
         break;
-    case(2):
-        _eval_fork_data.ret = 1;
+    case(ACTION_LOG):
+        datalog("fork");
+    case(ACTION_SUCCESS): // success
+        // Returns the value present in _eval_fork_data.ret
+        if ( _eval_fork_data.ret < 0 ) _eval_fork_data.ret = 0;
         break;
-    case(1):
-        _eval_fork_data.ret = 0;
-        break;
-
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("fork() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
-
     default:
         _eval_fork_data.ret = fork( );
     }
@@ -1258,11 +1345,12 @@ EVAL_VAR(wait);
  * Evaluate implementation calling of wait function
  * Requires data in global _eval_wait_data
  * 
- * Behavior:
- *   .action = EVAL_BLOCK    Issue error and abort program
- *   .action = 2    Return immediately without changing .ret
- *   .action = 1    Return 0 immediately without calling wait()
- *   default        call wait( stat_loc )
+ * .action behavior:
+ * + `ACTION_ERROR`   - (error) Return -1
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`
+ * + `ACTION_SUCCESS` - (success) Return value previously set in `_eval_fork_data.ret`. 
+ *                      If the value was less than 0 it is set to 0.
+ * + `ACTION_DEFAULT` - Capture parameters and call `wait(stat_loc)`
  *
  * @return          Evalation result or result of wait operation
  */
@@ -1271,28 +1359,39 @@ pid_t _eval_wait(int *stat_loc) {
     _eval_wait_data.status ++;
     _eval_wait_data.stat_loc = stat_loc;
 
+    int err = 0;
+    if ( stat_loc != NULL ) {
+        if ( eval_checkptr( stat_loc ) != 0 ) {
+            eval_error("wait() called with invalid pointer (stat_loc)\n");
+            err++;
+        }
+    }
+
     switch( _eval_wait_data.action ) {
 
-    case(3): // inject
-        // Don't change the value of _eval_wait_data.ret
-        break;
-
-    case(2): // error
+    case(ACTION_ERROR): // error
         _eval_wait_data.ret = -1;
         errno = EINVAL;
         break;
 
-    case(1): // succes
-        _eval_wait_data.ret = 0;
+    case(ACTION_LOG):
+        datalog("wait,%p", stat_loc);
+
+    case(ACTION_SUCCESS): // succes
+        if ( _eval_wait_data.ret < 0 ) _eval_wait_data.ret = 0;
         break;
 
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("wait() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
 
     default:
-        _eval_wait_data.ret = wait( stat_loc );
+        if ( ! err ) {
+            _eval_wait_data.ret = wait( stat_loc );
+        } else {
+            _eval_wait_data.ret = -1;
+        }
     }
     return _eval_wait_data.ret;
 }
@@ -1308,15 +1407,23 @@ EVAL_VAR(waitpid);
  * Requires data in global _eval_waitpid_data
  * 
  * Behavior:
- *   .action = EVAL_BLOCK    Issue error and abort program
- *   .action = 2    Return -1 (error) immediately without calling waitpid(),
- *                  and sets errno to EINVAL
- *   .action = 1    Return pid immediately without calling waitpid()
- *   default        call waitpid( pid, stat_loc, options )
+ * + `ACTION_ERROR`   - (error) Return -1
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`
+ * + `ACTION_SUCCESS` - (success) Return value of `pid` parameter. If `pid` was
+ *                      `-1` it also sets `errno` to `ECHILD`
+ * + `ACTION_DEFAULT` - Capture parameters and call `waitpid(pid,stat_loc,options)`
  *
  * @return          Evalation result or result of wait operation
  */
 pid_t _eval_waitpid(pid_t pid, int *stat_loc, int options) {
+
+    int stat_loc_ok = 1;
+    if ( stat_loc != NULL ) {
+        if ( eval_checkptr( stat_loc ) != 0 ) {
+            eval_error("waitpid() called with invalid pointer (stat_loc)\n");
+            stat_loc_ok = 0;
+        }
+    }
 
     _eval_waitpid_data.status ++;
 
@@ -1326,22 +1433,30 @@ pid_t _eval_waitpid(pid_t pid, int *stat_loc, int options) {
 
     switch( _eval_waitpid_data.action ) {
 
-    case(2):
+    case(ACTION_ERROR):
         _eval_waitpid_data.ret = -1;
         errno = EINVAL;
         break;
-    case(1):
+
+    case(ACTION_LOG):
+        datalog("waitpid,%d,%p,%d", pid,stat_loc,options);
+
+    case(ACTION_SUCCESS):
         _eval_waitpid_data.ret = pid;
         if ( pid == -1 ) errno = ECHILD;
         break;
 
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("waitpid() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
 
     default:
-        _eval_waitpid_data.ret = waitpid( pid, stat_loc, options );
+        if ( stat_loc_ok ) {
+            _eval_waitpid_data.ret = waitpid( pid, stat_loc, options );
+        } else {
+            _eval_waitpid_data.ret = -1;
+        }
     }
     return _eval_waitpid_data.ret;
 }
@@ -1357,10 +1472,13 @@ EVAL_VAR(kill);
  * Requires data in global _eval_kill_data
  * 
  * Behavior:
- *   .action = 3    Don't call kill(), log call
- *   .action = 2    Return 0 immediately without calling kill()
- *   .action = 1    Check if pid is ok before calling kill()
- *   default        call kill( pid, sig )
+ * + `ACTION_ERROR`   - (error) Return -1
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`
+ * + `ACTION_SUCCESS` - (success) Return 0
+ * + `ACTION_DEFAULT` - Capture parameters and call `kill(pid,sig)`
+ * + `ACTION_PROTECT` - Same as default `ACTION_DEFAULT` but prevent routine from
+ *                      signaling self, parent, process group and every process 
+ *                      belonging to process owner
  *
  * @param pid   Process(es) to send signal to
  * @param sig   Signal to be sent
@@ -1374,25 +1492,24 @@ int _eval_kill(pid_t pid, int sig) {
     int err;
 
     switch( _eval_kill_data.action ) {
-    case(3): // log
-        datalog("kill,%d,%d", pid, sig );
-        _eval_kill_data.ret = 0;
-        break;
-    case(2): // error
+    case(ACTION_ERROR): // error
         _eval_kill_data.ret = -1;
         errno = EINVAL;
         break;
 
-    case(1): // success
+    case(ACTION_LOG): // log
+        datalog("kill,%d,%d", pid, sig );
+
+    case(ACTION_SUCCESS): // success
         _eval_kill_data.ret = 0;
         break;
 
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("kill() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
 
-    case(EVAL_PROTECT): // Catch bad pid values
+    case(ACTION_PROTECT): // Catch bad pid values
         err = 0;
         if ( getpid() == pid ) {
             eval_error("(kill) prevented sending signal to self");
@@ -1436,9 +1553,10 @@ EVAL_VAR(raise);
  * Requires data in global _eval_raise_data
  * 
  * Behavior:
- *   .action = 2    Return 0 immediately without calling raise()
- *   .action = 1    Issue error message, then return 0 immediately without calling raise()
- *   default        call raise( sig )
+ * + `ACTION_ERROR`   - (error) Return -1
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`
+ * + `ACTION_SUCCESS` - (success) Return 0
+ * + `ACTION_DEFAULT` - Capture parameters and call `raise(sig)`
  *
  * @param sig       Signal to be sent
  * @return int      error status
@@ -1448,19 +1566,19 @@ int _eval_raise( int sig ) {
     _eval_raise_data.sig = sig;
 
     switch( _eval_raise_data.action ) {
-    case(2):    // error
+    case(ACTION_ERROR):    // error
         _eval_raise_data.ret = -1;
         errno = EINVAL;
         break;
-    case(1):    // success
-        _eval_raise_data.ret = 0;
-        break;
-    case(EVAL_PROTECT):    // Issue error message
-        eval_error("(raise) prevented sending signal to self");
+
+    case(ACTION_LOG): // log
+        datalog("raise,%d", sig );
+
+    case(ACTION_SUCCESS):    // success
         _eval_raise_data.ret = 0;
         break;
 
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("raise() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
@@ -1484,9 +1602,10 @@ EVAL_VAR(signal);
  * Note: The use of SIGPROF is reserved for the eval programs
  *
  * Behavior:
- *   .action = 2    Log call, return SIG_DFL without calling signal()
- *   .action = 1    eturn SIG_DFL without calling signal()
- *   default        call signal( signum, handler )
+ * + `ACTION_ERROR`   - (error) Return `SIG_ERR`
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`
+ * + `ACTION_SUCCESS` - (success) Return `SIG_DFL`
+ * + `ACTION_DEFAULT` - Capture parameters and call `signal(signum,handler)`
  * 
  * @param signum    Signal to be handled
  * @param handler   Signal handler
@@ -1527,17 +1646,15 @@ sighandler_t _eval_signal(int signum, sighandler_t handler) {
         errno = EINVAL;
     } else {
         switch( _eval_signal_data.action ) {
-        case(3):
-            datalog("signal,%d,%p", signum, handler );
-            _eval_signal_data.ret = SIG_DFL;
-            break;
-        case(2):
+        case(ACTION_ERROR):
             _eval_signal_data.ret = SIG_ERR;
             break;
-        case(1):
+        case(ACTION_LOG):
+            datalog("signal,%d,%p", signum, handler );
+        case(ACTION_SUCCESS):
             _eval_signal_data.ret = SIG_DFL;
             break;
-        case(EVAL_BLOCK):
+        case(ACTION_BLOCK):
             eval_error("signal() called, aborting");
             siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
             break;
@@ -1561,16 +1678,36 @@ EVAL_VAR(sigaction);
  * Note: The use of SIGPROF is reserved for the eval programs
  *
  * Behavior:
- *   .action = 2    Log call, return 0 without sigaction signal()
- *   .action = 1    return 0 without sigaction signal()
- *   default        call sigaction( signum, act, oldact )
+ * + `ACTION_ERROR`   - (error) Return -1
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ *                      Unless `act -> sa_flags` had the `SA_SIGINFO` bit set, the
+ *                      function will be logged as if the corresponding `signal()`
+ *                      call was made.
+ * + `ACTION_SUCCESS` - (success) Return 0
+ * + `ACTION_DEFAULT` - Capture parameters and call `sigaction(signum,act,oldact)`
  * 
  * @param signum    Signal to be handled
  * @param act       Signal handler
  * @param oldaction Signal handler
- * @return          Previous value of signal handler, SIG_ERR on error
+ * @return          0 on success, -1 on error
  */
 int _eval_sigaction(int signum, const struct sigaction *act, struct sigaction *oldact) {
+
+    int err = 0;
+    if ( act != NULL ) {
+        if ( eval_checkconstptr( act ) != 0 ) {
+            eval_error("sigaction() called with invalid pointer (act)\n");
+            err++;
+        }
+    }
+
+    if ( oldact != NULL ) {
+        if ( eval_checkptr( oldact ) != 0 ) {
+            eval_error("sigaction() called with invalid pointer (oldact)\n");
+            err++;
+        }
+    }
+
     _eval_sigaction_data.status ++;
     _eval_sigaction_data.signum = signum;
     _eval_sigaction_data.act = (struct sigaction *) act;
@@ -1606,26 +1743,28 @@ int _eval_sigaction(int signum, const struct sigaction *act, struct sigaction *o
         errno = EINVAL;
     } else {
         switch( _eval_sigaction_data.action ) {
-        case(3):
+        case(ACTION_ERROR):
+            _eval_sigaction_data.ret = -1;
+            break;
+        case(ACTION_LOG):
             if ( act -> sa_flags & SA_SIGINFO ) {
                 datalog("sigaction,%d,%p", signum, act->sa_sigaction );
             } else {
                 datalog("signal,%d,%p", signum, act->sa_handler );
             }
+        case(ACTION_SUCCESS):
             _eval_sigaction_data.ret = 0;
             break;
-        case(2):
-            _eval_sigaction_data.ret = -1;
-            break;
-        case(1):
-            _eval_sigaction_data.ret = 0;
-            break;
-        case(EVAL_BLOCK):
+        case(ACTION_BLOCK):
             eval_error("sigaction() called, aborting");
             siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
             break;
         default:
-            _eval_sigaction_data.ret = sigaction( signum, act, oldact );
+            if ( ! err ) {
+                _eval_sigaction_data.ret = sigaction( signum, act, oldact );
+            } else {
+                _eval_sigaction_data.ret = -1;
+            }
         }
     }
     return _eval_sigaction_data.ret;
@@ -1642,9 +1781,10 @@ EVAL_VAR(pause);
  * Requires data in global _eval_pause_data
  * 
  * Behavior:
- *   .action = EVAL_BLOCK    Issue error and abort program
- *   .action = 1    return -1 without calling pause()
- *   default        call pause()
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ * + `ACTION_SUCCESS` - (success) Return -1. Note: the `pause()` command always
+ *                      returns -1.
+ * + `ACTION_DEFAULT` - Call `pause()`
  *
  * @return          Always returns -1
  */
@@ -1652,15 +1792,15 @@ int _eval_pause(void) {
     _eval_pause_data.status ++;
 
     switch( _eval_pause_data.action ) {
-    case(1):
+    case(ACTION_LOG):
+        datalog("pause");
+    case(ACTION_SUCCESS):
         _eval_pause_data.ret = -1;
         break;
-
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("pause() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
-
     default:
         _eval_pause_data.ret = pause( );
     }
@@ -1678,8 +1818,9 @@ EVAL_VAR(alarm);
  * Requires data in global _eval_alarm_data
  * 
  * Behavior:
- *   .action = 1    return seconds without calling alarm()
- *   default        call alarm( seconds )
+ * + `ACTION_ERROR`   - (previous alarm running) Return 1 (1s left on previous alarm)
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ * + `ACTION_SUCCESS` - (success) Return 0 (no previous alarm running)
  *
  * @param seconds       Number of seconds until SIGALARM
  * @return              Number of seconds remaining on previous alarm 
@@ -1690,19 +1831,18 @@ unsigned int _eval_alarm( unsigned int seconds ) {
     _eval_alarm_data.seconds = seconds;
 
     switch( _eval_alarm_data.action ) {
-    case(2):
+    case(ACTION_ERROR):
         _eval_alarm_data.ret = 1;
         break;
-
-    case(1):
+    case(ACTION_LOG):
+        datalog("alarm,%d",seconds);
+    case(ACTION_SUCCESS):
         _eval_alarm_data.ret = 0;
         break;
-
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("alarm() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
-
     default:
         _eval_alarm_data.ret = alarm( seconds );
     }
@@ -1718,9 +1858,19 @@ EVAL_VAR(msgget);
 /**
  * Evaluate implementation calling of msgget function
  * 
+ * Function `.action` options:
+ * + `ACTION_RETRY`   - (retry) Fail on first try (ENOENT), behave as `ACTION_SUCCESS`
+ *                       on 2nd try, fail on remaining attempts (EINVAL)
+ * + `ACTION_CREATE`  - (must create) If `IPC_CREAT` was specified then behave as
+ *                      `ACTION_SUCCESS` otherwise return -1 (ENOENT)
+ * + `ACTION_ERROR`   - (error) Return -1 (EINVAL)
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ * + `ACTION_SUCCESS` - (success) Return the value set in `_eval_msgget_data.msqid`
+ * + `ACTION_DEFAULT` - Capture parameters and call `msgget(key,msgflg)`
+ * 
  * @param key       IPC key of msg queue
  * @param msgflg    Flag controlling msg queue creation / connection
- * @return          Evalation result or result of msgget operation
+ * @return          Result or result of msgget operation
  */
 int _eval_msgget(key_t key, int msgflg) {
 
@@ -1734,7 +1884,7 @@ int _eval_msgget(key_t key, int msgflg) {
     _eval_msgget_data.msgflg = msgflg;
 
     switch( _eval_msgget_data.action ) {
-    case(4): // error (ENOENT) on first try, inject on 2nd try
+    case(ACTION_RETRY): // error (ENOENT) on first try, inject on 2nd try
         switch( _eval_msgget_data.status ) {
         case (1):
             errno = ENOENT;
@@ -1749,27 +1899,29 @@ int _eval_msgget(key_t key, int msgflg) {
             errno = EINVAL;
         }
         break;
-    case(3): // inject on create only
+
+    case(ACTION_CREATE): // inject on create only
         if ( ! (msgflg & IPC_CREAT ) ) {
             _eval_msgget_data.ret = -1;
-            errno = EINVAL;
+            errno = ENOENT;
         } else {
             _eval_msgget_data.ret = _eval_msgget_data.msqid;
         }
         break;
-    case(2): // error (EINVAL)
+
+    case(ACTION_ERROR): // error (EINVAL)
         _eval_msgget_data.ret = -1;
         errno = EINVAL;
         break;
-    case(1): // inject
+    case(ACTION_LOG):
+        datalog("msgget,%x,%d",key,msgflg);
+    case(ACTION_SUCCESS): // inject
         _eval_msgget_data.ret = _eval_msgget_data.msqid;
         break;
-
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("msgget() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
-
     default:
         _eval_msgget_data.ret = msgget( key, msgflg );
     }
@@ -1787,11 +1939,23 @@ EVAL_VAR(msgsnd);
  * Evaluate implementation calling of msgsnd function
  * Requires data in global _eval_msgsnd_data
  * 
+ * Function `.action` options:
+ * 
+ * + `ACTION_INJECT`  - (inject) Call `msgsnd()` but using the parameters specified
+ *                      in `_eval_msgsnd_data`
+ * + `ACTION_ERROR`   - (error) Return -1
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ * + `ACTION_SUCCESS` - (success) Return `msgsz`. If `msgp` was a valid pointer,
+ *                      then the data in `*msgp` is copied to a newly allocated
+ *                      buffer at `_eval_msgsnd_data.msgp`. This buffer __must__
+ *                      be freed afterwards.
+ * + `ACTION_DEFAULT` - Capture parameters and call `msgsnd(msqid,msgp,msgsz,msgflg)`
+ * 
  * @param msqid     Queue ID to use
  * @param msgp      Pointer to message structure
  * @param msgsz     Size of message body
  * @param msgflg    
- * @return          Evalation result or result of msgsnd operation
+ * @return          Result of msgsnd operation
  */
 int _eval_msgsnd(int msqid, const void *msgp, size_t msgsz, int msgflg) {
 
@@ -1799,25 +1963,23 @@ int _eval_msgsnd(int msqid, const void *msgp, size_t msgsz, int msgflg) {
     printf( _EVAL_DEBUG_PREFIX "msgsnd( %d, %p, %zu, %d )\n", msqid, msgp, msgsz, msgflg );
 #endif
 
+    int err = 0;
+    if ( eval_checkconstptr( msgp ) != 0 ) {
+        eval_error("msgsnd() called with invalid pointer (msgp)\n");
+        err++;
+    }
+
     _eval_msgsnd_data.status ++;
 
     switch( _eval_msgsnd_data.action ) {
 
-    case(4): // ignore
-        _eval_msgsnd_data.msqid = msqid;
-        _eval_msgsnd_data.msgp = (void *) msgp;
-        _eval_msgsnd_data.msgsz = msgsz;
-        _eval_msgsnd_data.msgflg = msgflg;
-
-        _eval_msgsnd_data.ret = 0;
-        break;
-    
-    case(3): // inject
-        _eval_msgsnd_data.ret = msgsnd( _eval_msgsnd_data.msqid, _eval_msgsnd_data.msgp,
+    case(ACTION_INJECT): // inject
+        _eval_msgsnd_data.ret = msgsnd( 
+            _eval_msgsnd_data.msqid, _eval_msgsnd_data.msgp,
             _eval_msgsnd_data.msgsz, _eval_msgsnd_data.msgflg );
         break;
 
-    case(2): // error
+    case(ACTION_ERROR): // error
         _eval_msgsnd_data.msqid = msqid;
         _eval_msgsnd_data.msgp = (void *) msgp;
         _eval_msgsnd_data.msgsz = msgsz;
@@ -1826,7 +1988,10 @@ int _eval_msgsnd(int msqid, const void *msgp, size_t msgsz, int msgflg) {
         _eval_msgsnd_data.ret = -1;
         break;
 
-    case(1): // capture
+    case(ACTION_LOG):
+        datalog("msgsnd,%d,%p,%zu,%d",msqid,msgp,msgsz,msgflg);
+
+    case(ACTION_SUCCESS): // capture
         _eval_msgsnd_data.msqid = msqid;
         _eval_msgsnd_data.msgsz = msgsz;
         _eval_msgsnd_data.msgflg = msgflg;
@@ -1836,17 +2001,17 @@ int _eval_msgsnd(int msqid, const void *msgp, size_t msgsz, int msgflg) {
         
         _eval_msgsnd_data.msgp = NULL;
 
-        if ( msgsz >= 0 && ( eval_checkptr( (void *) msgp ) == 0 )) {
-            size_t bytes = sizeof(long) + msgsz;
+        if ( ! err ) {
+            size_t bytes = sizeof(long);
+            if ( msgsz >= 0 ) bytes += msgsz;
             _eval_msgsnd_data.msgp = malloc( bytes );
             memcpy( _eval_msgsnd_data.msgp, msgp, bytes );
         }
 
-        _eval_msgsnd_data.ret = _eval_msgsnd_data.msgsz;
+        _eval_msgsnd_data.ret = 0;
         break;
 
-
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("msgsnd() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
@@ -1857,7 +2022,11 @@ int _eval_msgsnd(int msqid, const void *msgp, size_t msgsz, int msgflg) {
         _eval_msgsnd_data.msgsz = msgsz;
         _eval_msgsnd_data.msgflg = msgflg;
 
-       _eval_msgsnd_data.ret = msgsnd( msqid, msgp, msgsz, msgflg );
+        if ( ! err ) {
+            _eval_msgsnd_data.ret = msgsnd( msqid, msgp, msgsz, msgflg );
+        } else {
+            _eval_msgsnd_data.ret = -1;
+        }
         break;
     }
 
@@ -1874,6 +2043,15 @@ EVAL_VAR(msgrcv);
  * Evaluate implementation calling of msgsnd function
  * Requires data in global _eval_msgrcv_data
  * 
+ * Function `.action` options:
+ * 
+ * + `ACTION_INJECT`  - (inject) Copy data in `*_eval_msgsnd_data.msgp` to `*msgp`.
+ *                      The pointer `msgp` is checked before copying.
+ * + `ACTION_ERROR`   - (error) Return -1
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ * + `ACTION_SUCCESS` - (success) Return `msgsz`.
+ * + `ACTION_DEFAULT` - Capture parameters and call `msgrcv( msqid, msgp, msgsz, msgtyp, msgflg )`
+ * 
  * @param msqid     Queue ID to use
  * @param msgp      Pointer to message structure
  * @param msgsz     Size of message body
@@ -1886,17 +2064,22 @@ ssize_t _eval_msgrcv(int msqid, void *msgp, size_t msgsz, long msgtyp, int msgfl
     printf( _EVAL_DEBUG_PREFIX "msgrcv( %d, %p, %zu, %ld, %d )\n", msqid, msgp, msgsz, msgtyp, msgflg );
 #endif
 
+    int err = 0;
+    if ( eval_checkptr( msgp ) != 0 ) {
+        eval_error("msgrcv() called with invalid pointer (msgp)\n");
+        err++;
+    }
 
     _eval_msgrcv_data.status ++;
 
     switch( _eval_msgrcv_data.action ) {
 
-    case(3): // inject
+    case(ACTION_INJECT): // inject
         _eval_msgrcv_data.msqid = msqid;
         _eval_msgrcv_data.msgtyp = msgtyp;
         _eval_msgrcv_data.msgflg = msgflg;
 
-        if ( eval_checkptr(msgp) == 0 ) {
+        if ( !err ) {
             size_t bytes = sizeof(long);
             if ( msgsz >= _eval_msgrcv_data.msgsz ) {
                 bytes += _eval_msgrcv_data.msgsz;
@@ -1912,7 +2095,7 @@ ssize_t _eval_msgrcv(int msqid, void *msgp, size_t msgsz, long msgtyp, int msgfl
 
         break;
 
-    case(2): // error
+    case(ACTION_ERROR): // error
         _eval_msgrcv_data.msqid = msqid;
         _eval_msgrcv_data.msgp = msgp;
         _eval_msgrcv_data.msgsz = msgsz;
@@ -1922,7 +2105,10 @@ ssize_t _eval_msgrcv(int msqid, void *msgp, size_t msgsz, long msgtyp, int msgfl
         _eval_msgrcv_data.ret = -1;
         break;
 
-    case(1): // capture
+    case(ACTION_LOG):
+        datalog("msgrcv,%d,%p,%zu,%ld,%d",msqid,msgp,msgsz,msgtyp,msgflg);
+
+    case(ACTION_SUCCESS): // capture
         _eval_msgrcv_data.msqid = msqid;
         _eval_msgrcv_data.msgp = msgp;
         _eval_msgrcv_data.msgsz = msgsz;
@@ -1930,9 +2116,10 @@ ssize_t _eval_msgrcv(int msqid, void *msgp, size_t msgsz, long msgtyp, int msgfl
         _eval_msgrcv_data.msgflg = msgflg;
         
         _eval_msgrcv_data.ret = msgsz;
+
         break;
 
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("msgrcv() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
@@ -1944,7 +2131,11 @@ ssize_t _eval_msgrcv(int msqid, void *msgp, size_t msgsz, long msgtyp, int msgfl
         _eval_msgrcv_data.msgtyp = msgtyp;
         _eval_msgrcv_data.msgflg = msgflg;
         
-        _eval_msgrcv_data.ret =  msgrcv( msqid, msgp, msgsz, msgtyp, msgflg );
+        if ( ! err ) {
+            _eval_msgrcv_data.ret =  msgrcv( msqid, msgp, msgsz, msgtyp, msgflg );
+        } else {
+            _eval_msgrcv_data.ret = -1;
+        }
     }
     return _eval_msgrcv_data.ret;
 
@@ -1957,13 +2148,20 @@ ssize_t _eval_msgrcv(int msqid, void *msgp, size_t msgsz, long msgtyp, int msgfl
 EVAL_VAR(msgctl);
 
 /**
- * Evaluate implementation calling of shmctl function
- * Requires data in global _eval_shmctl_data
+ * Evaluate implementation calling of msgctl function
+ * Requires data in global _eval_msgctl_data
  * 
- * @param shmid     Shared memory ID
+ * Function `.action` options:
+ * 
+ * + `ACTION_ERROR`   - (error) Return -1 (EINVAL)
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ * + `ACTION_SUCCESS` - (success) Return 0
+ * + `ACTION_DEFAULT` - Capture parameters and call `msgctl( msqid, cmd, buf )`
+ * 
+ * @param msqid     Message queue id
  * @param cmd       Command to perform
- * @param buf       struct shmid_ds for input / output of command
- * @return          success
+ * @param buf       struct msqid_ds for input / output of command
+ * @return int      success
  */
 int _eval_msgctl(int msqid, int cmd, struct msqid_ds *buf) {
 
@@ -1977,11 +2175,17 @@ int _eval_msgctl(int msqid, int cmd, struct msqid_ds *buf) {
     _eval_msgctl_data.buf = buf;
     
     switch( _eval_msgctl_data.action ) {
-    case(1):
+
+    case(ACTION_ERROR):
+        _eval_msgctl_data.ret = -1;
+        errno = EINVAL;
+        break;
+    case(ACTION_LOG):
+        datalog("msgctl,%d,%d,%p",msqid,cmd,(void*)buf);
+    case(ACTION_SUCCESS):
         _eval_msgctl_data.ret = 0;
         break;
-
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("msgctl() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
@@ -2022,7 +2226,7 @@ int _eval_semget(key_t key, int nsems, int semflg) {
     _eval_semget_data.semflg = semflg;
 
     switch( _eval_semget_data.action ) {
-        case(4): // error (ENOENT) on first try, inject on 2nd try
+        case(ACTION_RETRY): // error (ENOENT) on first try, inject on 2nd try
             switch( _eval_semget_data.status ) {
             case (1):
                 errno = ENOENT;
@@ -2038,7 +2242,7 @@ int _eval_semget(key_t key, int nsems, int semflg) {
             }
             break;
         
-        case(3): // inject on create only
+        case(ACTION_CREATE): // inject on create only
             if ( nsems == 0  && ( semflg & IPC_CREAT ) ) {
                 _eval_semget_data.ret = -1;
                 errno = EINVAL;
@@ -2047,17 +2251,19 @@ int _eval_semget(key_t key, int nsems, int semflg) {
             }
             break;
 
-        case(2): // error (EINVAL)
+        case(ACTION_ERROR): // error (EINVAL)
             _eval_semget_data.ret = -1;
             errno = EINVAL;
             break;
 
-        case(1): // inject
+        case(ACTION_LOG):
+            datalog("semget,%x,%d,%o",key,nsems,semflg);
+
+        case(ACTION_SUCCESS): // inject
             _eval_semget_data.ret = _eval_semget_data.semid;
             break;
 
-
-        case(EVAL_BLOCK):
+        case(ACTION_BLOCK):
             eval_error("semget() called, aborting");
             siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
             break;
@@ -2076,8 +2282,15 @@ int _eval_semget(key_t key, int nsems, int semflg) {
 EVAL_VAR(semctl);
 
 /**
- * Evaluate implementation calling of semctl function
+ * @brief Evaluate implementation calling of semctl function
  * Requires data in global _eval_semctl_data
+ * 
+ * Function `.action` options:
+ * 
+ * + `ACTION_ERROR`   - (error) Return -1 (EINVAL)
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ * + `ACTION_SUCCESS` - (success) Return the 0
+ * + `ACTION_DEFAULT` - Capture parameters and call `semctl(semid,semnum,cmd,...)`
  * 
  * @param semid     semaphore id
  * @param sops      Semaphore operations
@@ -2111,20 +2324,17 @@ int _eval_semctl(int semid, int semnum, int cmd, ... ) {
     }
 
     switch (_eval_semctl_data.action) {
-    case(3): // log
-        datalog("semctl,%d,%d,%d", semid, semnum, cmd );
-        _eval_semctl_data.ret = 0;
 
-    case(2): // error
+    case(ACTION_ERROR): // error
         _eval_semctl_data.ret = -1;
         errno = EINVAL;
         break;
-
-    case(1): // success
+    case(ACTION_LOG): // log
+        datalog("semctl,%d,%d,%d", semid, semnum, cmd );
+    case(ACTION_SUCCESS): // success
         _eval_semctl_data.ret = 0;
         break;
-
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("semctl() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
@@ -2153,8 +2363,15 @@ int _eval_semctl(int semid, int semnum, int cmd, ... ) {
 EVAL_VAR(semop);
 
 /**
- * Evaluate implementation calling of semop function
+ * @brief Evaluate implementation calling of semop function
  * Requires data in global _eval_semop_data
+ * 
+ * Function `.action` options:
+ * 
+ * + `ACTION_ERROR`   - (error) Return -1 (EINVAL)
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ * + `ACTION_SUCCESS` - (success) Return the 0
+ * + `ACTION_DEFAULT` - Capture parameters and call `semop(semid,sops,nsops)`
  * 
  * @param semid     semaphore id
  * @param sops      Semaphore operations
@@ -2163,9 +2380,15 @@ EVAL_VAR(semop);
  */
 int _eval_semop(int semid, struct sembuf *sops, size_t nsops) {
 
+    int err = 0;
+    if ( eval_checkptr( sops ) != 0 ) {
+        eval_error("semop() called with invalid pointer (sops)\n");
+        err++;
+    }
+
 #ifdef _EVAL_DEBUG
     printf( _EVAL_DEBUG_PREFIX "semop( %d, %p, %zu )\n", semid, (void *) sops ,nsops );
-    if ( nsops > 0 && !eval_checkptr(sops) ) {
+    if ( nsops > 0 && !err ) {
         for( int i = 0; i < nsops; i++ ) {
             printf( "    ↳ op(%d) = {num:%d, op:%+d, flag:%d}\n", i, sops[i].sem_num, sops[i].sem_op, sops[i].sem_flg );
         }
@@ -2178,29 +2401,31 @@ int _eval_semop(int semid, struct sembuf *sops, size_t nsops) {
     _eval_semop_data.nsops = nsops;
 
     switch( _eval_semop_data.action ) {
-    case(3):
-        for( int i = 0; i < nsops; i++ ) {
-            datalog("semop,%d,%d,%d,%d", semid, sops[i].sem_num, sops[i].sem_op, sops[i].sem_flg );
-        }
-        _eval_semop_data.ret = 0;
-        break;
-    case(2): // error
+    case(ACTION_ERROR): // error
         _eval_semop_data.ret = -1;
         errno = EINVAL;
         break;
-
-    case(1): // success
+    case(ACTION_LOG):
+        if ( !err ) {
+            for( int i = 0; i < nsops; i++ ) {
+                datalog("semop,%d,%d,%d,%d", semid, sops[i].sem_num, sops[i].sem_op, sops[i].sem_flg );
+            }
+        }
+    case(ACTION_SUCCESS): // success
         _eval_semop_data.ret = 0;
         break;
-
-
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("semop() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
 
     default:
-        _eval_semop_data.ret = semop( semid, sops, nsops );
+        if ( ! err ) {
+            _eval_semop_data.ret = semop( semid, sops, nsops );
+        } else {
+            _eval_semop_data.ret = -1;
+            errno = EINVAL;
+        }
     }
 
     
@@ -2215,8 +2440,19 @@ int _eval_semop(int semid, struct sembuf *sops, size_t nsops) {
 EVAL_VAR(shmget);
 
 /**
- * Evaluate implementation calling of shmget function
+ * @brief Evaluate implementation calling of shmget function
  * Requires data in global _eval_semget_data
+ * 
+ * Function `.action` options:
+ * 
+ * + `ACTION_RETRY`   - (retry) Fail on first try (ENOENT), behave as `ACTION_SUCCESS`
+ *                      on 2nd try, fail on remaining attempts (EINVAL)
+ * + `ACTION_CREATE`  - (must create) If `IPC_CREAT` was specified then behave as
+ *                      `ACTION_SUCCESS` otherwise return -1 (ENOENT)
+ * + `ACTION_ERROR`   - (error) Return -1 (EINVAL)
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ * + `ACTION_SUCCESS` - (success) Return the value set in `_eval_shmget_data.shmid`
+ * + `ACTION_DEFAULT` - Capture parameters and call `shmget( key, size, shmflg )`
  * 
  * @param key       IPC key
  * @param size      Size of shared memory region
@@ -2236,7 +2472,7 @@ int _eval_shmget(key_t key, size_t size, int shmflg) {
     _eval_shmget_data.shmflg = shmflg;
 
     switch( _eval_shmget_data.action ) {
-    case(4): // error (ENOENT) on first try, inject on 2nd try
+    case(ACTION_RETRY): // error (ENOENT) on first try, inject on 2nd try
         switch( _eval_shmget_data.status ) {
         case (1):
             errno = ENOENT;
@@ -2253,27 +2489,26 @@ int _eval_shmget(key_t key, size_t size, int shmflg) {
             _eval_shmget_data.ret = -1;
         }
         break;
-    case(3): // error
-        _eval_shmget_data.ret = -1;
-        errno = EINVAL;
-        break;
-    case(2): // inject on create only
+    case(ACTION_CREATE): // inject on create only
         if ( size == 0  && ( shmflg & IPC_CREAT ) ) {
                 _eval_shmget_data.ret = -1;
         } else {
             _eval_shmget_data.ret = _eval_shmget_data.shmid;
         }
         break;
-
-    case(1): // inject
+    case(ACTION_ERROR): // error
+        _eval_shmget_data.ret = -1;
+        errno = EINVAL;
+        break;
+    case(ACTION_LOG): // log
+        datalog("shmget,%x,%ld,%d", key, size, shmflg );
+    case(ACTION_SUCCESS): // success
         _eval_shmget_data.ret = _eval_shmget_data.shmid;
         break;
-
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("shmget() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
-
     default:
         _eval_shmget_data.shmid = shmget( key, size, shmflg );
         _eval_shmget_data.ret = _eval_shmget_data.shmid;
@@ -2289,8 +2524,15 @@ int _eval_shmget(key_t key, size_t size, int shmflg) {
 EVAL_VAR(shmat);
 
 /**
- * Evaluate implementation calling of shmat function
- * Requires data in global _eval_semget_data
+ * @brief Evaluate implementation calling of shmat function
+ * Requires data in global _eval_shmat_data
+ * 
+ * Function `.action` options:
+ * 
+ * + `ACTION_ERROR`   - (error) Return `(void *) -1` (EINVAL)
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ * + `ACTION_SUCCESS` - (success) Return the value set in `_eval_shmat_data.shmaddr`
+ * + `ACTION_DEFAULT` - Capture parameters and call `shmat( shmid, shmaddr, shmflg )`
  * 
  * @param shmid     Shared memory ID
  * @param shmaddr   Choice for logical address
@@ -2304,19 +2546,22 @@ void *_eval_shmat( int shmid, const void *shmaddr, int shmflg) {
 #endif
 
     _eval_shmat_data.status ++;
+    _eval_shmat_data.shmid = shmid;
+    _eval_shmat_data.shmaddr = (void *) shmaddr;
+    _eval_shmat_data.shmflg = shmflg;
 
     switch( _eval_shmat_data.action ) {
-    case(1): // inject
+    case(ACTION_ERROR):
+        _eval_shmat_data.ret = (void *) -1;
+        errno=EINVAL;
+        break;
+    case(ACTION_LOG): // log
+        datalog("shmat,%d,%p,%d", shmid, shmaddr, shmflg );
+    case(ACTION_SUCCESS): // inject
         _eval_shmat_data.ret = _eval_shmat_data.shmaddr;
-
-        _eval_shmat_data.shmid = shmid;
-        _eval_shmat_data.shmaddr = (void *) shmaddr;
-        _eval_shmat_data.shmflg = shmflg;
-
         break;
 
-
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("shmat() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
@@ -2342,6 +2587,13 @@ EVAL_VAR(shmdt);
  * Evaluate implementation calling of shmdt function
  * Requires data in global _eval_shmdt_data
  * 
+ * Function `.action` options:
+ * 
+ * + `ACTION_ERROR`   - (error) Return -1 (EINVAL)
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ * + `ACTION_SUCCESS` - (success) Return 0
+ * + `ACTION_DEFAULT` - Capture parameters and call `shmdt( shmaddr )`
+ * 
  * @param shmaddr   Logical address of shared memory region to detach
  * @return          success
  */
@@ -2356,16 +2608,19 @@ int _eval_shmdt(const void *shmaddr) {
     
     switch( _eval_shmdt_data.action ) {
 
-    case( 2 ): // error
+    case( ACTION_ERROR ): // error
         _eval_shmdt_data.ret = -1;
         errno = EINVAL;
         break;
 
-    case( 1 ): // success
+    case( ACTION_LOG ): // log
+        datalog("shmdt,%p", shmaddr );
+
+    case( ACTION_SUCCESS ): // success
         _eval_shmdt_data.ret = 0;
         break;
 
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("shmdt() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
@@ -2373,7 +2628,6 @@ int _eval_shmdt(const void *shmaddr) {
     default:
         _eval_shmdt_data.ret = shmdt( shmaddr );
     }
-
 
     return _eval_shmdt_data.ret;
 }
@@ -2387,6 +2641,13 @@ EVAL_VAR(shmctl);
 /**
  * Evaluate implementation calling of shmctl function
  * Requires data in global _eval_shmctl_data
+ * 
+ * Function `.action` options:
+ * 
+ * + `ACTION_ERROR`   - (error) Return -1 (EINVAL)
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ * + `ACTION_SUCCESS` - (success) Return 0
+ * + `ACTION_DEFAULT` - Capture parameters and call `shmdt( shmaddr )`
  * 
  * @param shmid     Shared memory ID
  * @param cmd       Command to perform
@@ -2405,15 +2666,16 @@ int _eval_shmctl(int shmid, int cmd, struct shmid_ds *buf) {
     _eval_shmctl_data.buf = buf;
 
     switch( _eval_shmctl_data.action ) {
-    case(2): //log
+    case( ACTION_ERROR ):
+        _eval_shmctl_data.ret = -1;
+        errno = EINVAL;
+        break;
+    case( ACTION_LOG ): //log
         datalog("shmctl,%d,%d,%p", shmid, cmd, buf );
-        _eval_shmctl_data.ret = 0;
-
-    case(1): // success
+    case( ACTION_SUCCESS ): // success
         _eval_shmctl_data.ret = 0;
         break;
-
-    case(EVAL_BLOCK):
+    case( ACTION_BLOCK ):
         eval_error("shmctl() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
@@ -2435,10 +2697,12 @@ EVAL_VAR(mkfifo);
  * @brief Evaluate implementation calling of mkfifo function
  * Requires data in global _eval_mkfifo_data
  *
- * Behavior:
- *   .action = 2    return -1 (error) without calling mkfifo()
- *   .action = 1    return  0 (success) without calling mkfifo()
- *   default        call mkfifo()
+ * Function `.action` options:
+ * 
+ * + `ACTION_ERROR`   - (error) Return -1 (EINVAL)
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ * + `ACTION_SUCCESS` - (success) Return 0
+ * + `ACTION_DEFAULT` - Capture parameters and call `mkfifo( path, mode )`
  *
  * @param path      Path to FIFO
  * @param mode      Creation mode
@@ -2447,24 +2711,38 @@ EVAL_VAR(mkfifo);
 int _eval_mkfifo(const char *path, mode_t mode) {
     
     _eval_mkfifo_data.status ++;
-    strncpy( _eval_mkfifo_data.path, path, PATH_MAX );
     _eval_mkfifo_data.mode = mode;
 
+    int err = 0;
+    if ( eval_checkconstptr(path) ) {
+        eval_error("mkfifo(path,mode) invalid path");
+        _eval_mkfifo_data.path[0] = 0;
+        err++;
+    } else {
+        strncpy( _eval_mkfifo_data.path, path, PATH_MAX );
+    }
+
     switch( _eval_mkfifo_data.action ) {
-        case(2):
+        case( ACTION_ERROR ):
             _eval_mkfifo_data.ret = -1;
             errno = EINVAL;
             break;
-        case(1):
+        case( ACTION_LOG ): //log
+            datalog("mkfifo,%s,%o", _eval_mkfifo_data.path, mode );
+        case( ACTION_SUCCESS ):
             _eval_mkfifo_data.ret = 0;
             break;
-        case(EVAL_BLOCK):
+        case(ACTION_BLOCK):
             eval_error("mkfifo() called, aborting");
             siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
             break;
-
         default:
-            _eval_mkfifo_data.ret = mkfifo( path, mode );
+            if ( !err ) {
+                _eval_mkfifo_data.ret = mkfifo( path, mode );
+            } else {
+                _eval_mkfifo_data.ret = -1;
+                errno = EINVAL;
+            }
     }
     return _eval_mkfifo_data.ret;
 }
@@ -2480,9 +2758,12 @@ EVAL_VAR(isfifo);
  *
  * Requires data in global _eval_isfifo_data
  *
- * Behavior:
- *   .action = 1    Return 1 without calling `S_ISFIFO()`
- *   default        call S_ISFIFO()
+ * Function `.action` options:
+ * 
+ * + `ACTION_ERROR`   - (not a FIFO) Return 0
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ * + `ACTION_SUCCESS` - (is a FIFO) Return 1
+ * + `ACTION_DEFAULT` - Capture parameters and call `S_ISFIFO( mode )`
  *
  * @param mode  File mode from stat or fstat
  * @return      For action = 1 always returns true, for action = 0
@@ -2492,22 +2773,24 @@ int _eval_isfifo(mode_t mode) {
     
     _eval_isfifo_data.status ++;
     _eval_isfifo_data.mode = mode;
-    _eval_isfifo_data.ret = S_ISFIFO(mode);
 
     switch( _eval_isfifo_data.action ) {
-        case(2):
-            return 0;
-        case(1):
-            return 1;
-        case(EVAL_BLOCK):
+        case(ACTION_ERROR):
+            _eval_isfifo_data.ret = 0;
+            break;
+        case( ACTION_LOG ): //log
+            datalog("S_ISFIFO,%o", mode );
+        case(ACTION_SUCCESS):
+            _eval_isfifo_data.ret = 1;
+            break;
+        case(ACTION_BLOCK):
             eval_error("S_ISFIFO() called, aborting");
             siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
             break;
-
         default:
-            return _eval_isfifo_data.ret;
+            _eval_isfifo_data.ret = S_ISFIFO(mode);
     }
-    return 0;
+    return _eval_isfifo_data.ret;
 }
 
 /**
@@ -2521,42 +2804,55 @@ EVAL_VAR(remove);
  *
  * Requires data in global _eval_remove_data
  *
- *  Behavior:
- *    .action = 3 - Log call parameters and return 0 without calling remove().
- *                  Note that the function call is logged as if the
- *                  corresponding `unlink()` function call was made.
- *    .action = 2 - Return -1 without calling remove()
- *    .action = 1 - Return 0 without calling remove()
- *    default     - Call remove()
+ * Function `.action` options:
+ * 
+ * + `ACTION_ERROR`   - (error) Return -1 (EINVAL)
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ *                      Note that the function call is logged as if the
+ *                      corresponding `unlink()` function call was made.
+ * + `ACTION_SUCCESS` - (success) Return 0
+ * + `ACTION_DEFAULT` - Capture parameters and call `remove( path )`
  *
  * @param path      File name
  * @return int      0 on success, -1 on error
  */
 int _eval_remove(const char * path) {
     _eval_remove_data.status ++;
-    strncpy( _eval_remove_data.path, path, PATH_MAX );
+
+    int err = 0;
+    if ( eval_checkconstptr(path) ) {
+        eval_error("remove(path) invalid path");
+        _eval_remove_data.path[0] = 0;
+        err++;
+    } else {
+        strncpy( _eval_remove_data.path, path, PATH_MAX );
+    }
+
     _eval_remove_data.ret = 0;
 
     switch( _eval_remove_data.action ) {
-    case(3): // log
-        // We use "unlink" deliberately
-        datalog("unlink,%s", path );
-        _eval_remove_data.ret = 0;
-        break;
-    case(2): // error
+    case(ACTION_ERROR): // error
         _eval_remove_data.ret = -1;
         errno = EINVAL;
         break;
-    case(1): // success
+    case( ACTION_LOG ): //log
+        // We use "unlink" deliberately
+        datalog("unlink,%s", _eval_remove_data.path );
+    case(ACTION_SUCCESS): // success
         _eval_remove_data.ret = 0;
         break;
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("remove() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
 
     default:
-        _eval_remove_data.ret = remove( path );
+        if ( !err ) {
+            _eval_remove_data.ret = remove( path );
+        } else {
+            _eval_remove_data.ret = -1;
+            errno = EINVAL;
+        }
     }
     return _eval_remove_data.ret;
 }
@@ -2583,24 +2879,39 @@ EVAL_VAR(unlink);
  */
 int _eval_unlink(const char * path) {
     _eval_unlink_data.status ++;
-    strncpy( _eval_unlink_data.path, path, PATH_MAX );
     _eval_unlink_data.ret = 0;
 
+    int err = 0;
+    if ( eval_checkconstptr(path) ) {
+        eval_error("unlink(path) invalid path");
+        _eval_unlink_data.path[0] = 0;
+        err++;
+    } else {
+        strncpy( _eval_unlink_data.path, path, PATH_MAX );
+    }
+
     switch( _eval_unlink_data.action ) {
-    case(2):
-        datalog("unlink,%s", path );
+    case(ACTION_ERROR):
+        _eval_unlink_data.ret = -1;
+        errno = EINVAL;
+        break;
+    case(ACTION_LOG):
+        datalog("unlink,%s", _eval_unlink_data.path );
+    case(ACTION_SUCCESS):
         _eval_unlink_data.ret = 0;
         break;
-    case(1):
-        _eval_unlink_data.ret = 0;
-        break;
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("unlink() called, aborting");
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
 
     default:
-        _eval_unlink_data.ret = unlink( path );
+        if ( !err ) {
+            _eval_unlink_data.ret = unlink( path );
+        } else {
+            _eval_unlink_data.ret = -1;
+            errno = EINVAL;
+        }
     }
     return _eval_unlink_data.ret;
 }
@@ -2619,6 +2930,13 @@ EVAL_VAR(atoi);
  * The nptr pointer is checked before calling atoi(). On failure the value -1
  * is returned.
  * 
+ * Function `.action` options:
+ * 
+ * + `ACTION_ERROR`   - (error) Return INT32_MIN
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ * + `ACTION_SUCCESS` - (success) Return previous `_eval_atoi_data.ret` value
+ * + `ACTION_DEFAULT` - Capture parameters and call `atoi( nptr )`
+ * 
  * @param nptr      String to be converted to integer
  * @return int      Converted value
  */
@@ -2627,31 +2945,40 @@ int _eval_atoi( const char *nptr ) {
 
     _eval_atoi_data.ret = -1;
 
-    if ( ! eval_checkptr( (void *) nptr ) ) {
+    int err = 0;
+    if ( ! eval_checkconstptr( nptr ) ) {
+        eval_error("atoi(nptr) called with invalid nptr");
+        _eval_atoi_data.nptr[0] = 0;
+        err++;
+    } else {
         strncpy( _eval_atoi_data.nptr, nptr, 32 );
-
         // atoi() is unsafe, we first check if the supplied string
         // has a length of up to 32 characters
-        if ( strnlen( nptr, 32 ) >= 32 ) {
-            eval_error("atoi(nptr) called with invalid string");
-        } else {
-            switch( _eval_atoi_data.action ) {
+        eval_error("atoi(nptr) called with invalid string");
+        err++;
+    }
 
-            case( 1 ):
-                _eval_atoi_data.ret = 1;
-                break;
+    switch( _eval_atoi_data.action ) {
+    case( ACTION_ERROR ):
+        _eval_atoi_data.ret = INT32_MIN;
+        break;
+    case( ACTION_LOG ):
+        datalog("atoi,%s", _eval_atoi_data.nptr );
+    case( ACTION_SUCCESS ):
+        // Keep _eval_atoi_data.ret value
+        // _eval_atoi_data.ret;
+        break;
+    case(ACTION_BLOCK):
+        eval_error("atoi() called, aborting");
+        siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
+        break;
 
-            case(EVAL_BLOCK):
-                eval_error("atoi() called, aborting");
-                siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
-                break;
-
-            default:
-                _eval_atoi_data.ret = atoi( nptr );
-            }
+    default:
+        if ( ! err ) {
+            _eval_atoi_data.ret = atoi( nptr );
+        }  else {
+            _eval_atoi_data.ret = -1;
         }
-    } else {
-        eval_error("atoi(nptr) called with invalid nptr");
     }
 
     return _eval_atoi_data.ret;
@@ -2676,30 +3003,35 @@ int _eval_fclose( FILE* stream ) {
     _eval_fclose_data.ret = -1;
     _eval_fclose_data.stream = stream;
 
+    int err = 0;
     if ( ! eval_checkptr( stream ) ) {
+        eval_error("fclose(stream) called with invalid stream");
+        err++;
+    }
 
-        switch( _eval_fclose_data.action ) {
+    switch( _eval_fclose_data.action ) {
 
-        case( 2 ): // error
+    case( ACTION_ERROR ): // error
+        _eval_fclose_data.ret = EOF;
+        errno = EINVAL;
+        break;
+    case(ACTION_LOG):
+        datalog("fclose,%p", stream );
+    case( ACTION_SUCCESS ): // success
+        _eval_fclose_data.ret = 0;
+        break;
+    case(ACTION_BLOCK):
+        eval_error("fclose() called, aborting");
+        siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
+        break;
+
+    default:
+        if ( ! err ) {
+            _eval_fclose_data.ret = fclose(stream);
+        } else {
             _eval_fclose_data.ret = EOF;
             errno = EINVAL;
-            break;
-        
-        case( 1 ): // success
-            _eval_fclose_data.ret = 0;
-            break;
-
-        case(EVAL_BLOCK):
-            eval_error("fclose() called, aborting");
-            siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
-            break;
-
-        default:
-            _eval_fclose_data.ret = _eval_fclose_data.ret = fclose(stream);
         }
-
-    } else {
-        eval_error("fclose(stream) called with invalid stream");
     }
 
     return _eval_fclose_data.ret;
@@ -2715,6 +3047,13 @@ EVAL_VAR(fread);
  * @brief  Evaluate implementation calling of fread() function
  *
  * Requires data in global _eval_fread_data
+ * 
+ * Function `.action` options:
+ * 
+ * + `ACTION_ERROR`   - (error) Return 0 (EINVAL)
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ * + `ACTION_SUCCESS` - (success) Return `nmemb`
+ * + `ACTION_DEFAULT` - Capture parameters and call `fread( ptr, size, nmemb, stream )`
  * 
  * @param ptr       Target memory location
  * @param size      Item size in bytes
@@ -2737,45 +3076,49 @@ size_t _eval_fread(void *restrict ptr, size_t size, size_t nmemb,
     int err = 0;
     if ( (void *) ptr == (void *) stream ) {
         eval_error("fread(ptr,size,nmemb,stream) ptr must not have the same value as stream");
-        err = 1;
+        err++;
     } else {
         if ( eval_checkptr(ptr) ) {
             eval_error("fread(ptr,size,nmemb,stream) invalid ptr (%p)", ptr);
-            err = 1;
+            err++;
         }
 
         if ( eval_checkptr(stream) ) {
             eval_error("fread(ptr,size,nmemb,stream) invalid stream (%p)", stream);
-            err = 1;
+            err++;
         }
     }
 
     if ( size * nmemb <= 0  ) {
         eval_error("fread(ptr,size,nmemb,stream) invalid size or nmemb");
-        err = 1;
+        err++;
     }
 
     _eval_fread_data.ret = 0;
-    if ( ! err ) {
         
-        switch( _eval_fread_data.action ) {
+    switch( _eval_fread_data.action ) {
 
-        case( 2 ):
-            _eval_fread_data.ret = -1;
-            errno = EINVAL;
-            break;
+    case( ACTION_ERROR ):
+        _eval_fread_data.ret = 0;
+        errno = EINVAL;
+        break;
+    case( ACTION_LOG ):
+        datalog("fread,%p,%ld,%ld,%p", ptr, size, nmemb, stream );
+    case( ACTION_SUCCESS ):
+        _eval_fread_data.ret = nmemb;
+        break;
 
-        case( 1 ):
-            _eval_fread_data.ret = nmemb;
-            break;
+    case(ACTION_BLOCK):
+        eval_error("fread() called, aborting");
+        siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
+        break;
 
-        case(EVAL_BLOCK):
-            eval_error("fread() called, aborting");
-            siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
-            break;
-
-        default:
+    default:
+        if ( ! err ) {
             _eval_fread_data.ret = fread( ptr, size, nmemb, stream );
+        } else {
+            _eval_fread_data.ret = 0;
+            errno = EINVAL;
         }
     }
 
@@ -2793,6 +3136,13 @@ EVAL_VAR(fwrite);
  * @brief  Evaluate implementation calling of fwrite() function
  *
  * Requires data in global _eval_fwrite_data
+ * 
+ * Function `.action` options:
+ * 
+ * + `ACTION_ERROR`   - (error) Return 0 (EINVAL)
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ * + `ACTION_SUCCESS` - (success) Return `nmemb`
+ * + `ACTION_DEFAULT` - Capture parameters and call `fwrite( ptr, size, nmemb, stream )`
  * 
  * @param ptr       Source memory location
  * @param size      Item size in bytes
@@ -2814,47 +3164,50 @@ size_t _eval_fwrite(const void *ptr, size_t size, size_t nmemb,
     int err = 0;
     if ( (void *) ptr == (void *) stream ) {
         eval_error("fwrite(ptr,size,nmemb,stream) ptr must not have the same value as stream");
-        err = 1;
+        err++;
     } else {
         if ( eval_checkptr(_eval_fwrite_data.ptr) ) {
             eval_error("fwrite(ptr,size,nmemb,stream) invalid ptr (%p)", ptr);
-            err = 1;
+            err++;
         }
 
         if ( eval_checkptr(stream) ) {
             eval_error("fwrite(ptr,size,nmemb,stream) invalid stream (%p)", stream);
-            err = 1;
+            err++;
         }
     }
 
     if ( size * nmemb <= 0  ) {
         eval_error("fwrite(ptr,size,nmemb,stream) invalid size or nmemb");
-        err = 1;
+        err++;
     }
 
     _eval_fwrite_data.ret = 0;
-    if ( ! err ) {
         
-        switch( _eval_fwrite_data.action ) {
+    switch( _eval_fwrite_data.action ) {
 
-        case( 1 ):
-            _eval_fwrite_data.ret = -1;
-            errno = EINVAL;
-            break;
+    case( ACTION_ERROR ):
+        _eval_fwrite_data.ret = 0;
+        errno = EINVAL;
+        break;
+    case( ACTION_LOG ):
+        datalog("fwrite,%p,%ld,%ld,%p", ptr, size, nmemb, stream );
+    case( ACTION_SUCCESS ):
+        _eval_fwrite_data.ret = nmemb;
+        break;
 
-        case( 0 ):
-            _eval_fwrite_data.ret = nmemb;
-            break;
+    case(ACTION_BLOCK):
+        eval_error("fwrite() called, aborting");
+        siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
+        break;
 
-        case(EVAL_BLOCK):
-            eval_error("fwrite() called, aborting");
-            siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
-            break;
-
-        default:
+    default:
+        if ( ! err ) {
             _eval_fwrite_data.ret = fwrite( ptr, size, nmemb, stream );
+        } else {
+            _eval_fwrite_data.ret = 0;
+            errno = EINVAL;
         }
-
     }
 
     return _eval_fwrite_data.ret;
@@ -2870,6 +3223,13 @@ EVAL_VAR(fseek);
  * @brief Evaluate implementation calling of fseek() function
  *
  * Requires data in global _eval_fseek_data
+ * 
+ * Function `.action` options:
+ * 
+ * + `ACTION_ERROR`   - (error) Return -1 (EINVAL)
+ * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
+ * + `ACTION_SUCCESS` - (success) Return 0
+ * + `ACTION_DEFAULT` - Capture parameters and call `fseek( stream, offset, whence )`
  * 
  * @param stream 
  * @param offset 
@@ -2887,7 +3247,7 @@ int _eval_fseek(FILE *stream, long offset, int whence) {
     int err = 0;
     if ( eval_checkptr( stream ) ) {
         eval_error("fseek(stream, offset, whence) invalid stream");
-        err += 1;
+        err ++;
     }
 
     switch( whence ) {
@@ -2897,34 +3257,35 @@ int _eval_fseek(FILE *stream, long offset, int whence) {
         break;
     default: 
         eval_error("fseek(stream, offset, whence) invalid value for whence");
-        err += 1;
+        err ++;
     }
 
     _eval_fseek_data.ret = -1;
-    if ( ! err ) {
-        switch( _eval_fseek_data.action ) {
+    switch( _eval_fseek_data.action ) {
 
-        case( 2 ): // error
+    case( ACTION_ERROR ): // error
+        _eval_fseek_data.ret = -1;
+        errno = EINVAL;
+        break;
+    case( ACTION_LOG ):
+        datalog("fseek,%p,%ld,%p", stream, offset, whence );
+    case( ACTION_SUCCESS ): // success
+        _eval_fseek_data.ret = 0;
+        break;
+
+    case(ACTION_BLOCK):
+        eval_error("fseek() called, aborting");
+        siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
+        break;
+
+    default:
+        if ( !err ) {
+            _eval_fseek_data.ret = fseek( stream, offset, whence );
+        } else {
             _eval_fseek_data.ret = -1;
             errno = EINVAL;
-            break;
-
-        case( 1 ): // success
-            _eval_fseek_data.ret = 0;
-            break;
-
-        case(EVAL_BLOCK):
-            eval_error("fseek() called, aborting");
-            siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
-            break;
-
-        default:
-            _eval_fseek_data.ret = fseek( stream, offset, whence );
         }
-    } else {
-        errno = EINVAL;
     }
-
     return _eval_fseek_data.ret;
 }
 
@@ -2956,24 +3317,38 @@ int _eval_execl(const char *path, ... ) {
 
     _eval_execl_data.status ++;
 
+    int err = 0;
+    if ( eval_checkconstptr( path ) ) {
+        eval_error("execl(path, ...) invalid path");
+        _eval_execl_data.path[0] = 0;
+        err++ ;
+    } else {
+        strncpy( _eval_execl_data.path, path, PATH_MAX );
+    }
+
     switch( _eval_execl_data.action ) {
 
-    case(1):
+    
+    case( ACTION_LOG ):
+        datalog("execl,%s", _eval_execl_data.path );
+    case(ACTION_ERROR):
         _eval_execl_data.ret = -1;
         break;
 
-    case(EVAL_BLOCK):
+    case(ACTION_BLOCK):
         eval_error("execl() called, aborting");
         _eval_execl_data.ret = -1;
         siglongjmp(_eval_env.jmp, EVAL_CATCH_BLOCKED );
         break;
 
     default:
-        {
+        if ( ! err ) {
             va_list args;
             va_start( args, path );
             _eval_execl_data.ret = execv( path, (char **)args );
             va_end( args );
+        } else {
+            _eval_execl_data.ret = -1;
         }
     }
     return _eval_execl_data.ret;
@@ -3045,7 +3420,7 @@ void eval_reset_vars( void ) {
  *  1 - Resets all _eval_*_data variables to 0, including the status and action fields
  *  2 - Resets all stats counters
  *  3 - Sets the timeout time to EVAL_TIMEOUT
- *  4 - Block execution of pause() and execl()
+ *  4 - Block execution of pause(), execl(), wait() and waitpid()
  *  5 - Prevent signals to self
  */
 void eval_reset( void ) {
@@ -3055,16 +3430,16 @@ void eval_reset( void ) {
     eval_reset_vars();
 
     // Abort test whenever pause() or execl() are called
-    _eval_pause_data.action = EVAL_BLOCK; 
-    _eval_execl_data.action = EVAL_BLOCK; 
+    _eval_pause_data.action = ACTION_BLOCK; 
+    _eval_execl_data.action = ACTION_BLOCK; 
 
     // Abort test whenever wait() or waitpid() are called
-    _eval_wait_data.action = EVAL_BLOCK; 
-    _eval_waitpid_data.action = EVAL_BLOCK; 
+    _eval_wait_data.action = ACTION_BLOCK; 
+    _eval_waitpid_data.action = ACTION_BLOCK; 
 
     // Prevent signals to self
-    _eval_raise_data.action = EVAL_PROTECT;
-    _eval_kill_data.action = EVAL_PROTECT;
+    _eval_raise_data.action = ACTION_BLOCK;
+    _eval_kill_data.action = ACTION_PROTECT;
 
     // Reset stats counters
     eval_reset_stats();

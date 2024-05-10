@@ -12,7 +12,7 @@ The `EVAL_CATCH()` macro allows an arbitrary function to be called catching all 
 The `_eval_env.stat` variable can be used to determine how the function was terminated:
 
 + A value of `0` indicates normal termination, i.e. the code reached the end without any interruption.
-+ A value `> 0` indicates that the code was terminated by one of the reasons stated above. See below for more details on checking the reason for code termination.
++ A value `> 0` indicates that the code was terminated for one of the reasons stated above. See below for more details on checking the reason for code termination.
 
 The macro must be called as:
 
@@ -38,7 +38,6 @@ int main() {
     eval_reset();
     EVAL_CATCH( p = &a; *p = 0; );
     printf("%s\n", _eval_env.stat ? "Test failed" : "Test ok" );
-}
 }
 ```
 
@@ -72,7 +71,7 @@ The macro should be called as follows:
 EVAL_CATCH_IO( _code, _fstdin, _fstdout )
 ````
 
-Where `_code` has the same behavior as in the `EVAL_CATCH()` macro and `_fstdin`/`_fstdout` are the names (strings) of the files to be used for `stdin` and `stdout`, respectively. If either are set to `NULL` then no redirection takes place.
+Where `_code` has the same behavior as in the `EVAL_CATCH()` macro and `_fstdin`/`_fstdout` are the names (strings) of the files to be used for `stdin` and `stdout`, respectively. If either are set to `NULL` then no redirection of that stream takes place.
 
 Here is a very simple example:
 
@@ -185,14 +184,15 @@ extern _eval_sleep_type _eval_sleep_data;
 
 #### `.action` field
 
-The `.action` field is used to control how the function wrapper is supposed to behave:
+The `.action` field is used to control how the function wrapper is supposed to behave. Most functions support the following options:
 
-+ The default behavior (`.action = EVAL_DEFAULT`) is to capture the function arguments, call the normal function, and store the return value (if any) in the `.ret` field.
-+ Setting `.action` to `EVAL_BLOCK` will cause the test code to issue an error message and stop if the function is called.
++ `EVAL_DEFAULT` (This is the default behavior) - Capture the function arguments, call the normal function, and store the return value (if any) in the `.ret` field. If a pointer argument is involved, it will usually be tested before calling the normal function.
++ `EVAL_BLOCK` - Issue an error message and stop if the function is called.
++ `EVAL_SUCCESS` - Return immediately as if the function executed successfuly.
++ `EVAL_LOG` - Log message parameters to `datalog` and return immediately as if the function executed successfuly (i.e. proceed to `EVAL_SUCCESS`)
++ `EVAL_ERROR` - Return immediately as if the function terminated in error. In most cases the variable `errno` will be set to an appropriate value.
 
-Specific wrappers may define alternate behaviors (see the documentation for each function). For example, if the user calls the `sleep(5)` function with `_eval_sleep_data.action = 1`, the function will return immediately without calling `sleep()` and setting `_eval_sleep_data.seconds = 5` and `_eval_sleep_data.ret = 0`.
-
-When creating new functions, or adding functionality to existing functions, keep in mind that you should always use `.action > EVAL_DEFAULT` to avoid conflicts with `EVAL_DEFAULT` and `EVAL_BLOCK`.
+Specific wrappers may define alternate behaviors (see the documentation for each function). When writing a test, you should set the required value of the `.action` field before calling the `EVAL()` macro.
 
 #### `.status` field
 
@@ -244,7 +244,7 @@ if ( ! proper_behavior_B )
 ...
 
 // nerr has the total number of errors
-nerr += eval_complete("test_function()");
+nerr = eval_complete("test_function()");
 
 ```
 
@@ -353,188 +353,216 @@ The `_eval_*_data.status` field will be incremented by 1.
 
 The behavior of a function can be changed by setting the corresponding `_eval_*_data.action` value. Setting this value to `EVAL_BLOCK` will stop the evaluation if the corresponding function is called by the test code, and an error message is issued. Other values triggering different behaviors are described below.
 
-### `exit( int status )`
+### exit( int status )
 
 The `exit()` function is a special case of the `eval` toolkit given that the underlying function will never be called. Instead, the function will be terminated and execution returned to the `EVAL_CATCH()` macro.
 
-Function options:
+Note that `_exit(int status)` and `_Exit(int status)` are also replaced by this function.
 
-+ `.action = 1` - Print info message with exit status
+#### Function `.action` options
 
-Fields in `_eval_exit_data`:
++ `ACTION_WARN` - Print warning message with exit status
+
+#### Fields in `_eval_exit_data`
 
 + `.status` - Function exit status, i.e., `exit()` function parameter
 
-### `abort()`
+### abort()
 
 Like the `exit()` function, the `abort()` function will never be called. Instead, the function will be terminated and execution returned to the `EVAL_CATCH()` macro.
 
-Function options:
+#### Function `.action` options:
 
-+ `.action = 1` - Print info message
++ `ACTION_WARN` - Print warning message
 
-### `sleep( unsigned int seconds )`
+### sleep( unsigned int seconds )
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 1` - Return 0 immediately without calling `sleep()`
++ `ACTION_ERROR`   - (error) Return 1 (interrupted by signal with 1 second left on timer)
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`
++ `ACTION_SUCCESS` - (success) Return 0 (timer finished)
++ `ACTION_DEFAULT` - Capture parameters and call `sleep(seconds)`
 
-Fields in `_eval_sleep_data`:
+#### Fields in `_eval_sleep_data`
 
 + `.ret`     - Return value of the function
 + `.seconds` - Value of the `seconds` parameter
 
-### `fork( )`
+### fork( )
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 3` - Return -1 immediately without calling `fork()` (i.e. issue error)
-+ `.action = 2` - Return 1 immediately without calling `fork()` (i.e. behave as parent process)
-+ `.action = 1` - Return 0 immediately without calling `fork()` (i.e. behave as child process)
++ `ACTION_ERROR`   - (error) Return -1
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`
++ `ACTION_SUCCESS` - (success) Return value previously set in `_eval_fork_data.ret`. If the value was less than 0 it is set to 0. If we want the `fork()` to behave as if it returns in the parent process, we should set this to a value `>= 1`.
++ `ACTION_DEFAULT` - Capture parameters and call `fork()`
 
-Fields in `_eval_fork_data`:
+#### Fields in `_eval_fork_data`:
 
 + `.ret`     - Return value of the function
 
-### `wait(int *stat_loc)`
+### wait( int *stat_loc )
 
 __Note__: The wrapper does not modify `*stat_loc` which means that the use of the `WIFEXITED()`, `WEXITSTATUS()`, etc. macros are not supported.
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 3` - (inject) Return immediately the value the previously set value in `_eval_wait_data.set`
-+ `.action = 2` - (error) Return -1
-+ `.action = 1` - (success) Return 0 immediately without calling `wait()`
++ `ACTION_ERROR`   - (error) Return -1
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`
++ `ACTION_SUCCESS` - (success) Return value previously set in `_eval_fork_data.ret`. If the value was less than 0 it is set to 0.
++ `ACTION_DEFAULT` - Capture parameters and call `wait(stat_loc)`
 
-Fields in `_eval_wait_data`:
+#### Fields in `_eval_wait_data`
 
 + `.ret`      - Return value of the function
 + `.stat_loc` - Value of the `stat_loc` parameter
 
-### `waitpid( pid_t pid, int *stat_loc, int options )`
+### waitpid( pid_t pid, int *stat_loc, int options )
 
 __Note__: The wrapper does not modify `*stat_loc` which means that the use of the `WIFEXITED()`, `WEXITSTATUS()`, etc. macros are not supported.
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 2` - (error) Return -1 (error) immediately without calling `waitpid()`, and sets errno to EINVAL
-+ `.action = 1` - (success) Return `pid` immediately without calling `waitpid()`
++ `ACTION_ERROR`   - (error) Return -1
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`
++ `ACTION_SUCCESS` - (success) Return value of `pid` parameter. If `pid` was `-1` it also sets `errno` to `ECHILD`
++ `ACTION_DEFAULT` - Capture parameters and call `waitpid(pid,stat_loc,options)`
 
-Fields in `_eval_waitpid_data`:
+#### Fields in `_eval_waitpid_data`
 
 + `.ret`      - Return value of the function
 + `.pid`      - Value of the `pid` parameter
 + `.stat_loc` - Value of the `stat_loc` parameter
 + `.options`  - Value of the `options` parameter
 
-### `kill(pid_t pid, int sig)`
+### kill(pid_t pid, int sig)
 
-Function options:
+__Note__: To prevent the process from signaling itself, `eval_reset()` sets `.action` to `ACTION_PROTECT`
 
-+ `.action = 3` - (log) Log call parameters in `datalog` and return 0 without calling `kill()`
-+ `.action = 2` - (error) Return -1 immediately without calling `kill()`
-+ `.action = 1` - (success) Return 0 immediately without calling `kill()`
-+ `.action = EVAL_PROTECT` - Prevent routine from signaling self, parent, process group and every process belonging to process owner
+#### Function `.action` options
 
-Fields in `_eval_kill_data`:
++ `ACTION_ERROR`   - (error) Return -1
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`
++ `ACTION_SUCCESS` - (success) Return 0
++ `ACTION_DEFAULT` - Capture parameters and call `kill(pid,sig)`
++ `ACTION_PROTECT` - Same as default `ACTION_DEFAULT` but prevent routine from signaling self, parent, process group and every process belonging to process owner
+
+#### Fields in `_eval_kill_data`
 
 + `.ret`      - Return value of the function
 + `.pid`      - Value of the `pid` parameter
 + `.sig`      - Value of the `sig` parameter
 
-### `raise( int sig )`
+### raise( int sig )
 
-Function options:
+__Note__: To prevent the process from signaling itself, `eval_reset()` sets `.action` to `ACTION_BLOCK`
 
-+ `.action = 2` - (error) Issue error and return 0 without calling `raise()`
-+ `.action = 1` - (success) Return 0 immediately without calling `raise()`
-+ `.action = EVAL_PROTECT` - Issue an error message and return 0 without calling `raise()`
+#### Function `.action` options
 
-Fields in `_eval_raise_data`:
++ `ACTION_ERROR`   - (error) Return -1
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`
++ `ACTION_SUCCESS` - (success) Return 0
++ `ACTION_DEFAULT` - Capture parameters and call `raise(sig)`
+
+#### Fields in `_eval_raise_data`
 
 + `.ret`      - Return value of the function
 + `.sig`      - Value of the `sig` parameter
 
-### `signal(int signum, sighandler_t handler )`
+### signal(int signum, sighandler_t handler )
 
 The function will prevent arming the `SIGPROF` signal, which is used by the `EVAL_CATCH()` macros to implement timeouts. Should the user try to arm `SIGPROF` the routine will issue an error, returning `SIG_ERR` and setting `errno = EINVAL`.
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 3` - (log) Log call parameters in `datalog` and return `SIG_DFL` without calling `signal()`
-+ `.action = 2` - (error) Return `SIG_ERR` without calling `signal()`
-+ `.action = 1` - (success) Return `SIG_DFL` without calling `signal()`
++ `ACTION_ERROR`   - (error) Return `SIG_ERR`
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`
++ `ACTION_SUCCESS` - (success) Return `SIG_DFL`
++ `ACTION_DEFAULT` - Capture parameters and call `signal(signum,handler)`
 
-Fields in `_eval_signal_data`:
+#### Fields in `_eval_signal_data`
 
 + `.ret`      - Return value of the function
 + `.signum`   - Value of the `signum` parameter
 + `.handler`  - Value of the `handler` parameter
 
-### `sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)`
+### sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 
 The function will prevent arming the `SIGPROF` signal, which is used by the `EVAL_CATCH()` macros to implement timeouts. Should the user try to arm `SIGPROF` the routine will issue an error, returning -1 and setting `errno = EINVAL`.
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 3` - (log) Log call parameters in `datalog` and return 0 without calling `sigaction()`. Note: unless `act -> sa_flags` had the `SA_SIGINFO` bit set, the function will be logged as if the corresponding `signal()` call was made.
-+ `.action = 2` - (error) Return -1 without calling `sigaction()` 
-+ `.action = 1` - (success) Return 0 without calling `sigaction()`
++ `ACTION_ERROR`   - (error) Return -1
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`. Unless `act -> sa_flags` had the `SA_SIGINFO` bit set, the function will be logged as if the corresponding `signal()` call was made.
++ `ACTION_SUCCESS` - (success) Return 0
++ `ACTION_DEFAULT` - Capture parameters and call `sigaction(signum,act,oldact)`
 
-Fields in `_eval_sigaction_data`:
+#### Fields in `_eval_sigaction_data`
 
 + `.ret`      - Return value of the function
 + `.signum`   - Value of the `signum` parameter
 + `.act`      - Value of the `act` parameter
 + `.oldact`   - Value of the `oldact` parameter
 
-### `pause()`
+### pause()
 
-Function options:
+__Note__: To prevent the process from blocking, `eval_reset()` sets `.action` to `ACTION_BLOCK`
 
-+ `.action = 1` - Return -1 without calling `pause()`. Note: the `pause()` command always returns -1,
+#### Function `.action` options
 
-Fields in `_eval_pause_data`:
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return -1. Note: the `pause()` command always returns -1.
++ `ACTION_DEFAULT` - Call `pause()`
+
+#### Fields in `_eval_pause_data`
 
 + `.ret`      - Return value of the function
 
-### `alarm( unsigned int seconds )`
+### alarm( unsigned int seconds )
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 2` - (time left) Return 1 without calling `alarm()`
-+ `.action = 1` - (success) Return 0 without calling `alarm()`
++ `ACTION_ERROR`   - (previous alarm running) Return 1 (1 s left on previous alarm)
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return 0 (no previous alarm running)
++ `ACTION_DEFAULT` - Capture parameters and call `alarm(seconds)`
 
-Fields in `_eval_alarm_data`:
+#### Fields in `_eval_alarm_data`
 
 + `.ret`      - Return value of the function
 + `.seconds`  - Value of the `seconds` parameter
 
-### `msgget(key_t key, int msgflg)`
+### msgget(key_t key, int msgflg)
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 4` - Return error on 1st time called, `_eval_msgget_data.msqid` on 2nd time
-+ `.action = 3` - (inject on create only) Return error if `IPC_CREAT` was not specified, `_eval_msgget_data.msqid` otherwise
-+ `.action = 2` - (error) Return -1
-+ `.action = 1` - (inject) Return the value set in `_eval_msgget_data.msqid`
++ `ACTION_RETRY`   - (retry) Fail on first try (ENOENT), behave as `ACTION_SUCCESS` on 2nd try, fail on remaining attempts (EINVAL)
++ `ACTION_CREATE`  - (must create) If `IPC_CREAT` was specified then behave as `ACTION_SUCCESS` otherwise return -1 (ENOENT)
++ `ACTION_ERROR`   - (error) Return -1 (EINVAL)
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return the value set in `_eval_msgget_data.msqid`
++ `ACTION_DEFAULT` - Capture parameters and call `msgget(key,msgflg)`
 
-Fields in `_eval_msgget_data`:
+#### Fields in `_eval_msgget_data`
 
 + `.ret`      - Return value of the function
 + `.key`      - Value of the `key` parameter
 + `.msgflg`   - Value of the `msgflg` parameter
 
-### `msgsnd(int msqid, const void *msgp, size_t msgsz, int msgflg)`
+### msgsnd(int msqid, const void *msgp, size_t msgsz, int msgflg)
 
-Function options:
+The routine will check for an invalid `msgp` pointer and issue an error message in case of a problem.
 
-+ `.action = 4` - (ignore) Return 0 without calling `msgsnd()`
-+ `.action = 3` - (inject) Call `msgsnd()` but using the parameters specified in `_eval_msgsnd_data`
-+ `.action = 2` - (error) Return -1
-+ `.action = 1` - (capture) Return `msgsz` (success). If `msgp` was a valid pointer, then the data in `*msgp` is copied to a newly allocated buffer at `_eval_msgsnd_data.msgp`. This buffer __must__ be freed afterwards.
+#### Function `.action` options:
 
-Fields in `_eval_msgsnd_data`:
++ `ACTION_INJECT`  - (inject) Call `msgsnd()` but using the parameters specified in `_eval_msgsnd_data`
++ `ACTION_ERROR`   - (error) Return -1
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return 0. If `msgp` was a valid pointer, then the data in `*msgp` is copied to a newly allocated buffer at `_eval_msgsnd_data.msgp`. This buffer __must__ be freed afterwards.
++ `ACTION_DEFAULT` - Capture parameters and call `msgsnd(msqid,msgp,msgsz,msgflg)`
+
+#### Fields in `_eval_msgsnd_data`
 
 + `.ret`      - Return value of the function
 + `.msqid`    - Value of the `msqid` parameter
@@ -542,15 +570,19 @@ Fields in `_eval_msgsnd_data`:
 + `.msgsz`    - Value of the `msgsz` parameter
 + `.msgflg`   - Value of the `msgflg` parameter
 
-### `msgrcv(int msqid, void *msgp, size_t msgsz, long msgtyp, int msgflg)`
+### msgrcv(int msqid, void *msgp, size_t msgsz, long msgtyp, int msgflg)
 
-Function options:
+The routine will check for an invalid `msgp` pointer and issue an error message in case of a problem.
 
-+ `.action = 3` - (inject) Copy data in `*_eval_msgsnd_data.msgp` to `*msgp`. The pointer `msgp` is checked before copying.
-+ `.action = 2` - (error) Return -1
-+ `.action = 1` - (capture) Return `msgsz` (success).
+#### Function `.action` options
 
-Fields in `_eval_msgrcv_data`:
++ `ACTION_INJECT`  - (inject) Copy data in `*_eval_msgsnd_data.msgp` to `*msgp`. The pointer `msgp` is checked before copying.
++ `ACTION_ERROR`   - (error) Return -1
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return `msgsz`.
++ `ACTION_DEFAULT` - Capture parameters and call `msgrcv( msqid, msgp, msgsz, msgtyp, msgflg )`
+
+#### Fields in `_eval_msgrcv_data`
 
 + `.ret`      - Return value of the function
 + `.msqid`    - Value of the `msqid` parameter
@@ -559,43 +591,49 @@ Fields in `_eval_msgrcv_data`:
 + `.msgsz`    - Value of the `msgsz` parameter
 + `.msgflg`   - Value of the `msgflg` parameter
 
-### `msgctl(int msqid, int cmd, struct msqid_ds *buf)`
+### msgctl(int msqid, int cmd, struct msqid_ds *buf)
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 1` - (success) Return 0
++ `ACTION_ERROR`   - (error) Return -1 (EINVAL)
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return 0
++ `ACTION_DEFAULT` - Capture parameters and call `msgctl( msqid, cmd, buf )`
 
-Fields in `_eval_msgctl_data`:
+#### Fields in `_eval_msgctl_data`
 
 + `.ret`      - Return value of the function
 + `.msqid`    - Value of the `msqid` parameter
 + `.cmd`      - Value of the `cmd` parameter
 + `.buf`      - Value of the `buf` parameter
 
-### `semget(key_t key, int nsems, int semflg)`
+### semget(key_t key, int nsems, int semflg)
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 4` - Return error on 1st time called, `_eval_semget_data.semid` on 2nd time
-+ `.action = 3` - (inject on create only) Return error if `IPC_CREAT` was not specified, `_eval_semget_data.semid` otherwise
-+ `.action = 2` - (error) Return -1 (error)
-+ `.action = 1` - (inject) Return the value set in `_eval_semget_data.semid`
++ `ACTION_RETRY`   - (retry) Fail on first try (ENOENT), behave as `ACTION_SUCCESS` on 2nd try, fail on remaining attempts (EINVAL)
++ `ACTION_CREATE`  - (must create) If `IPC_CREAT` was specified then behave as `ACTION_SUCCESS` otherwise return -1 (ENOENT)
++ `ACTION_ERROR`   - (error) Return -1 (EINVAL)
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return the value set in `_eval_semget_data.semid`
++ `ACTION_DEFAULT` - Capture parameters and call `semget(key,nsems,semflg)`
 
-Fields in `_eval_semget_data`:
+#### Fields in `_eval_semget_data`
 
 + `.ret`      - Return value of the function
 + `.nsems`    - Value of the `nsems` parameter
 + `.semflg`   - Value of the `semflg` parameter
 
-### `semctl(int semid, int semnum, int cmd, ... )`
+### semctl(int semid, int semnum, int cmd, ... )
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 3` - (log) Log function call ("semctl") in the data log and return 0
-+ `.action = 2` - (error) return -1
-+ `.action = 1` - (success) Return 0
++ `ACTION_ERROR`   - (error) Return -1 (EINVAL)
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return the 0
++ `ACTION_DEFAULT` - Capture parameters and call `semctl(semid,semnum,cmd,...)`
 
-Fields in `_eval_semctl_data`:
+#### Fields in `_eval_semctl_data`
 
 + `.ret`      - Return value of the function
 + `.semid`    - Value of the `semid` parameter
@@ -603,163 +641,193 @@ Fields in `_eval_semctl_data`:
 + `.cmd`      - Value of the `cmd` parameter
 + `.arg`      - Argument list for commands with extended argument parameters (e.g. `IPC_SET`)
 
-### `semop(int semid, struct sembuf *sops, size_t nsops)`
+### semop(int semid, struct sembuf *sops, size_t nsops)
 
-Function options:
+The routine will check for an invalid `sops` pointer and issue an error message in case of a problem.
 
-+ `.action = 3` - (log) Log function call ("semop") in the data log and return 0
-+ `.action = 2` - (error) return -1
-+ `.action = 1` - (success) Return 0
+#### Function `.action` options
 
-Fields in `_eval_semop_data`:
++ `ACTION_ERROR`   - (error) Return -1 (EINVAL)
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return the 0
++ `ACTION_DEFAULT` - Capture parameters and call `semop(semid,sops,nsops)`
+
+#### Fields in `_eval_semop_data`
 
 + `.ret`      - Return value of the function
 + `.semid`    - Value of the `semid` parameter
 + `.sops`     - Value of the `sops` parameter
 + `.nsops`    - Value of the `nsops` parameter
 
-### `shmget(key_t key, size_t size, int shmflg)`
+### shmget(key_t key, size_t size, int shmflg)
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 4` - Return error on 1st time called, `_eval_shmget_data.shmid` on 2nd time
-+ `.action = 3` - (inject on create only) Return error if `IPC_CREAT` was not specified, `_eval_shmget_data.shmid` otherwise
-+ `.action = 2` - (error) Return -1 (error)
-+ `.action = 1` - (inject) Return the value set in `_eval_shmget_data.shmid`
++ `ACTION_RETRY`   - (retry) Fail on first try (ENOENT), behave as `ACTION_SUCCESS` on 2nd try, fail on remaining attempts (EINVAL)
++ `ACTION_CREATE`  - (must create) If `IPC_CREAT` was specified then behave as `ACTION_SUCCESS` otherwise return -1 (ENOENT)
++ `ACTION_ERROR`   - (error) Return -1 (EINVAL)
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return the value set in `_eval_shmget_data.shmid`
++ `ACTION_DEFAULT` - Capture parameters and call `shmget( key, size, shmflg )`
 
-Fields in `_eval_shmget_data`:
+#### Fields in `_eval_shmget_data`
 
 + `.ret`      - Return value of the function
 + `.size`     - Value of the `size` parameter
 + `.shmflg`   - Value of the `shmflg` parameter
 
-### `shmat( int shmid, const void *shmaddr, int shmflg)`
+### shmat( int shmid, const void *shmaddr, int shmflg)
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 1` - (inject) Return the value set in `_eval_shmat_data.shmaddr`
++ `ACTION_ERROR`   - (error) Return `(void *) -1` (EINVAL)
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return the value set in `_eval_shmat_data.shmaddr`
++ `ACTION_DEFAULT` - Capture parameters and call `shmat( shmid, shmaddr, shmflg )`
 
-Fields in `_eval_shmat_data`:
+#### Fields in `_eval_shmat_data`
 
 + `.ret`      - Return value of the function
 + `.shmid`    - Value of the `shmid` parameter
 + `.shmaddr`  - Value of the `shmaddr` parameter
 + `.shmflg`   - Value of the `shmflg` parameter
 
-### `shmdt(const void *shmaddr)`
+### shmdt(const void *shmaddr)
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 2` - (error) Return -1
-+ `.action = 1` - (success) Return 0
++ `ACTION_ERROR`   - (error) Return -1 (EINVAL)
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return 0
++ `ACTION_DEFAULT` - Capture parameters and call `shmdt( shmaddr )`
 
-Fields in `_eval_shmdt_data`:
+#### Fields in `_eval_shmdt_data`:
 
 + `.ret`      - Return value of the function
 + `.shmaddr`  - Value of the `shmaddr` parameter
 
-### `shmctl(int shmid, int cmd, struct shmid_ds *buf)`
+### shmctl(int shmid, int cmd, struct shmid_ds *buf)
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 3` - (log) Log function call ("shmctl") in the data log and return 0
-+ `.action = 2` - (error) return -1
-+ `.action = 1` - (success) Return 0
++ `ACTION_ERROR`   - (error) Return -1 (EINVAL)
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return 0
++ `ACTION_DEFAULT` - Capture parameters and call `shmctl( shmid, cmd, buf )`
 
-Fields in `_eval_semctl_data`:
+#### Fields in `_eval_semctl_data`
 
 + `.ret`      - Return value of the function
 + `.semid`    - Value of the `semid` parameter
 + `.cmd`      - Value of the `cmd` parameter
 + `.buf`      - Value of the `buf` parameter
 
-### `mkfifo(const char *path, mode_t mode)`
+### mkfifo(const char *path, mode_t mode)
 
-Function options:
+The routine will check for an invalid `path` pointer and issue an error message in case of a problem.
 
-+ `.action = 2` - (error) Return -1 without calling `mkfifo()`
-+ `.action = 1` - (success) Return 0 without calling `mkfifo()`
+#### Function `.action` options
 
-Fields in `_eval_mkfifo_data`:
++ `ACTION_ERROR`   - (error) Return -1 (EINVAL)
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return 0
++ `ACTION_DEFAULT` - Capture parameters and call `mkfifo( path, mode )`
+
+#### Fields in `_eval_mkfifo_data`
 
 + `.ret`      - Return value of the function
-+ `.path`     - Copy of the value of the `path` parameter
++ `.path`     - Copy of the value of the `path` parameter (if `path` was a valid pointer)
 + `.mode`     - Value of the `mode` parameter
 
-### `S_ISFIFO(mode)`
+### S_ISFIFO(mode)
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 2` - Return 0 without calling `S_ISFIFO()`
-+ `.action = 1` - Return 1 without calling `S_ISFIFO()`
++ `ACTION_ERROR`   - (not a FIFO) Return 0
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (is a FIFO) Return 1
++ `ACTION_DEFAULT` - Capture parameters and call `S_ISFIFO( mode )`
 
-Fields in `_eval_isfifo_data`:
+#### Fields in `_eval_isfifo_data`
 
 + `.ret`      - Return value of the macro
 + `.mode`     - Value of the `mode` parameter
 
-### `remove(const char * path)`
+### remove(const char * path)#### 
 
-Function options:
+The routine will check for an invalid `path` pointer and issue an error message in case of a problem.
 
-+ `.action = 3` - (log) Log call parameters and return 0 without calling `remove()`. Note that the function call is logged as if the corresponding `unlink()` function call was made.
-+ `.action = 2` - (error) Return -1 without calling `remove()`
-+ `.action = 1` - (success) Return 0 without calling `remove()`
+#### Function `.action` options:
 
-Fields in `_eval_remove_data`:
++ `ACTION_ERROR`   - (error) Return -1 (EINVAL)
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`. Note that the function call is logged as if the corresponding `unlink()` function call was made.
++ `ACTION_SUCCESS` - (success) Return 0
++ `ACTION_DEFAULT` - Capture parameters and call `remove( path )`
 
-+ `.ret`      - Return value of the function
-+ `.path`     - Copy of the value of the `path` parameter
-
-### `unlink(const char * path)`
-
-Function options:
-
-+ `.action = 3` - (log) Log call parameters and return 0 without calling `unlink()`
-+ `.action = 2` - (error) Return -1 without calling `unlink()`
-+ `.action = 1` - (success) Return 0 without calling `unlink()`
-
-Fields in `_eval_unlink_data`:
+#### Fields in `_eval_remove_data`:
 
 + `.ret`      - Return value of the function
-+ `.path`     - Copy of the value of the `path` parameter
++ `.path`     - Copy of the value of the `path` parameter (if `path` was a valid pointer)
 
-### `atoi(const char *nptr )`
+### unlink(const char * path)
 
-Since `atoi()` is unsafe, the routine will first check for a valid string. If the supplied string is NULL or is longer than 32 characters the routine will issue an error message and return -1.
+The routine will check for an invalid `path` pointer and issue an error message in case of a problem.
 
-Function options:
+#### Function `.action` options:
 
-+ `.action = 1` - Return 1 as the result without calling `atoi()`
++ `ACTION_ERROR`   - (error) Return -1 (EINVAL)
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return 0
++ `ACTION_DEFAULT` - Capture parameters and call `unlink( path )`
 
-Fields in `_eval_atoi_data`:
+#### Fields in `_eval_unlink_data`:
+
++ `.ret`      - Return value of the function
++ `.path`     - Copy of the value of the `path` parameter (if `path` was a valid pointer)
+
+### atoi(const char *nptr )
+
+Since `atoi()` is unsafe, the routine will first check for a valid string. If the supplied string is NULL or is longer than 32 characters the routine will issue an error message.
+
+#### Function `.action` options:
+
++ `ACTION_ERROR`   - (error) Return INT32_MIN
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return previous `_eval_atoi_data.ret` value
++ `ACTION_DEFAULT` - Capture parameters and call `atoi( nptr )`
+
+#### Fields in `_eval_atoi_data`:
 
 + `.ret`      - Return value of the function
 + `.nptr`     - Copy of the value of the `nptr` parameter
 
-### `fclose( FILE* stream )`
+### fclose( FILE* stream )
 
-The routine will first check for a valid pointer. On error, the routine will issue an error message and return -1.
+The routine will first check for a valid pointer. On error, the routine will issue an error message.
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 2` - (error) Return error (EOF) and set `errno` to `EINVAL`
-+ `.action = 1` - (success) Return 0
++ `ACTION_ERROR`   - (error) Return EOF (EINVAL)
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return 0
++ `ACTION_DEFAULT` - Capture parameters and call `fclose( stream )`
 
-Fields in `_eval_fclose_data`:
+#### Fields in `_eval_fclose_data`
 
 + `.ret`      - Return value of the function
 
-### `fread( void *restrict ptr, size_t size, size_t nmemb, FILE *restrict stream )`
+### fread( void *restrict ptr, size_t size, size_t nmemb, FILE *restrict stream )
 
-The routine will validate the parameters (valid pointers, etc.) before calling `fread()`. On error, the function will return 0 without calling `fread()`.
+The routine will validate the parameters (valid pointers, etc.) before calling `fread()`. On error, the routine will issue an error message.
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 2` - (error) Return error (0) and set `errno` to `EINVAL`
-+ `.action = 1` - (success) Return `nmemb`
++ `ACTION_ERROR`   - (error) Return 0 (EINVAL)
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return `nmemb`
++ `ACTION_DEFAULT` - Capture parameters and call `fread( ptr, size, nmemb, stream )`
 
-Fields in `_eval_fread_data`:
+#### Fields in `_eval_fread_data`
 
 + `.ret`      - Return value of the function
 + `.ptr`      - Value of the `ptr` parameter
@@ -767,16 +835,18 @@ Fields in `_eval_fread_data`:
 + `.nmemb`    - Value of the `nmemb` parameter
 + `.stream`   - Value of the `stream` parameter
 
-### `fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)`
+### fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)
 
 The routine will validate the parameters (valid pointers, etc.) before calling `fwrite()`. On error, the function will return 0 without calling `fwrite()`.
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 2` - (error) Return error (0) and set `errno` to `EINVAL`
-+ `.action = 1` - (success) Return `nmemb`
++ `ACTION_ERROR`   - (error) Return 0 (EINVAL)
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return `nmemb`
++ `ACTION_DEFAULT` - Capture parameters and call `fwrite( ptr, size, nmemb, stream )`
 
-Fields in `_eval_fwrite_data`:
+#### Fields in `_eval_fwrite_data`
 
 + `.ret`      - Return value of the function
 + `.ptr`      - Value of the `ptr` parameter
@@ -784,17 +854,20 @@ Fields in `_eval_fwrite_data`:
 + `.nmemb`    - Value of the `nmemb` parameter
 + `.stream`   - Value of the `stream` parameter
 
-### `fseek(FILE *stream, long offset, int whence)`
+### fseek(FILE *stream, long offset, int whence)
 
-The routine will first check for a valid pointer and valid values for the `whence` parameter. On error, the routine will issue an error message and return -1.
+The routine will first check for a valid pointer and valid values for the `whence` parameter. On error, the routine will issue an error message.
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 2` - (error) Return error (-1) and set `errno` to `EINVAL`
-+ `.action = 1` - (success) Return 0
++ `ACTION_ERROR`   - (error) Return -1 (EINVAL)
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
++ `ACTION_SUCCESS` - (success) Return 0
++ `ACTION_DEFAULT` - Capture parameters and call `fseek( stream, offset, whence )`
 
-Fields in `_eval_fseek_data`:
+#### Fields in `_eval_fseek_data`
 
++ `.ret`      - Return value of the function
 + `.stream`   - Value of the `stream` parameter
 + `.offset`   - Value of the `offset` parameter
 + `.whence`   - Value of the `whence` parameter
@@ -803,19 +876,22 @@ Fields in `_eval_fseek_data`:
 
 The default settings implemented by the `eval_reset()` function will prevent the test function from calling this function, instead issuing an error and terminating the function.
 
-The function can be made to call `execl()` by setting `.action = 0` but unless the call fails this will replace the current process with a new one. Unless a new process was forked before this happens, this will of course stop the tests.
+The function can be made to call `execl()` by setting `.action = ACTION_DEFAULT` but unless the call fails this will replace the current process with a new one. If a new process was not forked before this happens, this will of course stop the tests.
 
-Function options:
+#### Function `.action` options
 
-+ `.action = 1` - Return -1 without calling `execl()`
++ `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_ERROR`. Note: this is different from the usual behavior.
++ `ACTION_ERROR`   - (error) Return -1
++ `ACTION_DEFAULT` - Capture parameters and call `execl(const char *path, ... )`
 
-Fields in `_eval_unlink_data`:
+#### Fields in `_eval_execl_data`
 
 + `.ret`      - Return value of the function. Note that this will only be updated in case of failure.
++ `.path`     - Copy of the value of the `path` parameter (if `path` was a valid pointer)
 
 ## Additional functions
 
-### `eval_reset()`
+### eval_reset()
 
 The `eval_reset()` function resets all functions to the default behavior and clears all counters. Specifically:
 
@@ -827,17 +903,17 @@ Additionally, the function will:
 + Set the timeout value to the `EVAL_TIMEOUT` macro. To disable timeouts you can compile the code with `-DEVAL_TIMEOUT=0`
 + Block the execution of `pause()` and `execl()` by setting their `.action` values to `EVAL_BLOCK`, as these would stop or destroy the current test.
 + Block the execution of `wait()` and `waitpid()` by setting their `.action` values to `EVAL_BLOCK`, as these would halt the current test.
-+ Prevent signals to self by setting the `raise()` and `kill()` by setting their `.action` values to `EVAL_PROTECT`, to avoid stopping the test.
++ Prevent signals to self by setting the `raise()` `.action` to `EVAL_BLOCK` and `kill()` `.action` to `EVAL_PROTECT`.
 
 Note that you can change all of these behaviors by modifying the corresponding `_eval_*_data` variable before calling the `EVAL_CATCH()` macro.
 
-### `eval_checkptr()`
+### eval_checkptr()
 
 The `eval_checkptr()` checks if a pointer is valid by reading and writing 1 byte from/to the specified address. The syntax is as follows:
 
 ```C
-int eval_checkptr( void* ptr )
-````
+int eval_checkptr( void * ptr )
+```
 
 The function will return one of the following values:
 
@@ -848,7 +924,17 @@ The function will return one of the following values:
 + 4 - Bus Error when accessing pointer
 + 5 - Invalid signal caught (should never happen)
 
-### `eval_error()`
+### eval_checkconstptr()
+
+The `eval_checkconstptr()` works like the previous routine, but it will only attempt to read from the address. The syntax is as follows:
+
+```C
+int eval_checkconstptr( const void * ptr )
+```
+
+The return values are the same as for the `eval_checkptr()` function.
+
+### eval_error()
 
 Prints out an information message. It precedes the message with a red "[✗]" marker. The `_eval_stats.error` variable is incremented.
 
@@ -860,7 +946,7 @@ int eval_error(const char *restrict format, ...)
 
 The function returns the updated value of `_eval_stats.error`
 
-### `eval_info()`
+### eval_info()
 
 Prints out an information message. It precedes the message with a blue "[ℹ︎]" marker. The `_eval_stats.info` variable is incremented.
 
@@ -872,7 +958,7 @@ int eval_info(const char *restrict format, ...)
 
 The function returns the updated value of `_eval_stats.info`
 
-### `eval_success()`
+### eval_success()
 
 Prints out a success message. It precedes the message with a green "[✔]" marker. The `_eval_stats.info` variable is incremented.
 
@@ -884,7 +970,7 @@ int eval_success(const char *restrict format, ...)
 
 The function returns the updated value of `_eval_stats.info`
 
-### `create_lockfile()` / `remove_lockfile()`
+### create_lockfile() / remove_lockfile()
 
 These functions allow creating/removing a "locked" file, i.e., a file with `000` permissions. The syntaxes are as follows:
 
