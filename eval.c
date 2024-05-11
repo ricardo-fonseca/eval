@@ -1357,7 +1357,6 @@ EVAL_VAR(wait);
 pid_t _eval_wait(int *stat_loc) {
 
     _eval_wait_data.status ++;
-    _eval_wait_data.stat_loc = stat_loc;
 
     int err = 0;
     if ( stat_loc != NULL ) {
@@ -1377,8 +1376,12 @@ pid_t _eval_wait(int *stat_loc) {
     case(ACTION_LOG):
         datalog("wait,%p", stat_loc);
 
-    case(ACTION_SUCCESS): // succes
+    case(ACTION_SUCCESS): // success
         if ( _eval_wait_data.ret < 0 ) _eval_wait_data.ret = 0;
+        if ( !err && stat_loc ) {
+            if ( _eval_wait_data.stat_loc ) *stat_loc = *_eval_wait_data.stat_loc;
+            else *stat_loc = 0;
+        }
         break;
 
     case(ACTION_BLOCK):
@@ -1393,6 +1396,8 @@ pid_t _eval_wait(int *stat_loc) {
             _eval_wait_data.ret = -1;
         }
     }
+
+    _eval_wait_data.stat_loc = stat_loc;
     return _eval_wait_data.ret;
 }
 
@@ -1409,31 +1414,31 @@ EVAL_VAR(waitpid);
  * Behavior:
  * + `ACTION_ERROR`   - (error) Return -1
  * + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`
- * + `ACTION_SUCCESS` - (success) Return value of `pid` parameter. If `pid` was
- *                      `-1` it also sets `errno` to `ECHILD`
+ * + `ACTION_SUCCESS` - (success) Return value previously set in `_eval_fork_data.ret`.
+ *                      If the value was less than 0 it is set to 0. If `stat_loc` is
+ *                      not NULL then `*stat_loc` will be set to `*_eval_wait_data.stat_loc`,
+ *                      if this is not NULL, or 0 otherwise
  * + `ACTION_DEFAULT` - Capture parameters and call `waitpid(pid,stat_loc,options)`
  *
  * @return          Evalation result or result of wait operation
  */
 pid_t _eval_waitpid(pid_t pid, int *stat_loc, int options) {
 
-    int stat_loc_ok = 1;
+    int err = 0;
     if ( stat_loc != NULL ) {
         if ( eval_checkptr( stat_loc ) != 0 ) {
             eval_error("waitpid() called with invalid pointer (stat_loc)\n");
-            stat_loc_ok = 0;
+            err ++;
         }
     }
 
     _eval_waitpid_data.status ++;
 
-    _eval_waitpid_data.pid = pid;
-    _eval_waitpid_data.stat_loc = stat_loc;
-    _eval_waitpid_data.options = options;
 
     switch( _eval_waitpid_data.action ) {
 
     case(ACTION_ERROR):
+        _eval_waitpid_data.stat_loc = stat_loc;
         _eval_waitpid_data.ret = -1;
         errno = EINVAL;
         break;
@@ -1442,8 +1447,15 @@ pid_t _eval_waitpid(pid_t pid, int *stat_loc, int options) {
         datalog("waitpid,%d,%p,%d", pid,stat_loc,options);
 
     case(ACTION_SUCCESS):
-        _eval_waitpid_data.ret = pid;
-        if ( pid == -1 ) errno = ECHILD;
+        if ( pid <= 0 ) {
+            _eval_waitpid_data.ret = _eval_waitpid_data.pid;
+        } else {
+            _eval_waitpid_data.ret = pid;
+        }
+        if ( !err && stat_loc ) {
+            if ( _eval_waitpid_data.stat_loc ) *stat_loc = *_eval_waitpid_data.stat_loc;
+            else *stat_loc = 0;
+        }
         break;
 
     case(ACTION_BLOCK):
@@ -1452,12 +1464,17 @@ pid_t _eval_waitpid(pid_t pid, int *stat_loc, int options) {
         break;
 
     default:
-        if ( stat_loc_ok ) {
+        if ( ! err ) {
             _eval_waitpid_data.ret = waitpid( pid, stat_loc, options );
         } else {
             _eval_waitpid_data.ret = -1;
         }
     }
+
+    _eval_waitpid_data.pid = pid;
+    _eval_waitpid_data.options = options;
+    _eval_waitpid_data.stat_loc = stat_loc;
+
     return _eval_waitpid_data.ret;
 }
 
