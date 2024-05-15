@@ -158,10 +158,10 @@ int eval_checkconstptr( const void* ptr );
 
 
 typedef struct {
-    int stdin;
-    int stdout;
-    int stdin_old;
-    int stdout_old;
+    // int stdin;
+    // int stdout;
+    int old_stdin;
+    int old_stdout;
 } _eval_stdio_t;
 
 int _eval_io_redirect( const char* , const char*  );

@@ -113,7 +113,7 @@ int main() {
 As noted above, the `_eval_env.stat` will be different from 0 in case the code does not finish normally. This variable may assume one of the following values:
 
 + `0` - Success, the code completed normally
-+ `EVAL_CATCH_EXIT` - The code was terminated by a call to the `exit()` function. You can check `_eval_exit_data.status` for the exit status value
++ `EVAL_CATCH_EXIT` - The code was terminated by a call to the `exit()`, `_exit()` or `_Exit()` functions. You can check `_eval_exit_data.status` for the exit status value
 + `EVAL_CATCH_ABORT` - The code was terminated by a call to the `abort()` function.
 + `EVAL_CATCH_BLOCKED` - The code was terminated due to a blocked function being called (this is the default behavior when calling `execv()` for example)
 + `EVAL_CATCH_SIGNAL` - A signal was caught, usually indicating some error in the code (e.g. invalid pointer) or a timeout. You can check `_eval_env.signal` for the signal value
@@ -902,19 +902,19 @@ The function will also test the `path` pointer and issue an error if a problem i
 
 ### eval_reset()
 
-The `eval_reset()` function resets all functions to the default behavior and clears all counters. Specifically:
+The `eval_reset()` function resets all functions to the default behavior. Specifically:
 
 + All `.action` and `.status` variables are set to 0, as are all remaining fields of the `_eval_*_data` variables
-+ `_eval_stats.error` and `_eval_stats.info` are set to 0
-
-Additionally, the function will:
-
 + Set the timeout value to the `EVAL_TIMEOUT` macro. To disable timeouts you can compile the code with `-DEVAL_TIMEOUT=0`
 + Block the execution of `pause()` and `execl()` by setting their `.action` values to `EVAL_BLOCK`, as these would stop or destroy the current test.
 + Block the execution of `wait()` and `waitpid()` by setting their `.action` values to `EVAL_BLOCK`, as these would halt the current test.
 + Prevent signals to self by setting the `raise()` `.action` to `EVAL_BLOCK` and `kill()` `.action` to `EVAL_PROTECT`.
 
 Note that you can change all of these behaviors by modifying the corresponding `_eval_*_data` variable before calling the `EVAL_CATCH()` macro.
+
+### eval_reset_stats()
+
+The `eval_reset_stats()` function resets the `_eval_stats.error` and `_eval_stats.info` counters. These are incremented by the `eval_error` and `eval_info` functions described below.
 
 ### eval_checkptr( void \* ptr )
 

@@ -2,8 +2,8 @@
  * @file eval.c
  * @author Ricardo Fonseca
  * @brief Toolkit for evaluating student code
- * @version 0.4.3
- * @date 2024-04-18
+ * @version 0.5.0
+ * @date 2024-05-15
  * 
  * @copyright Copyright (C) 2024 Ricardo Fonseca
  *
@@ -541,57 +541,57 @@ _eval_stdio_t _eval_stdio;
 int _eval_io_redirect( const char* _fstdin, const char* _fstdout ) {
 
     if ( _fstdin ) {
-        if ( (_eval_stdio.stdin_old = dup( STDIN_FILENO ))< 0 ) {
+        if ( (_eval_stdio.old_stdin = dup( STDIN_FILENO ))< 0 ) {
             eval_error("Unable to duplicate STDIN_FILENO");
             return -1;
         }
 
-        if ( close( STDIN_FILENO ) < 0 ) {
-            eval_error("Unable to close STDIN_FILENO");
-            return -1;
-        }
-
-        if ( (_eval_stdio.stdin = open( _fstdin, O_RDONLY )) < 0 ) {
+        int new_stdin;
+        if ( (new_stdin = open( _fstdin, O_RDONLY )) < 0 ) {
             eval_error("Unable to open file %s as read-only", _fstdin);
             return -1;
         }
-        if ( (dup2( _eval_stdio.stdin, STDIN_FILENO )) < 0 ) {
+        if ( (dup2( new_stdin, STDIN_FILENO )) < 0 ) {
             eval_error("Unable to associate file %s with stdin", _fstdin);
             return -1;
         };
+
+        if ( close(new_stdin) < 0 ) {
+            eval_error("Unable to close fd %d", new_stdin );
+            return -1;
+        };
+
     } else {
-        _eval_stdio.stdin_old = -1;
-        _eval_stdio.stdin = -1;
+        _eval_stdio.old_stdin = -1;
     }
 
     if ( _fstdout ) {
-        if ( (_eval_stdio.stdout_old = dup( STDOUT_FILENO )) < 0 ) {
+        if ( (_eval_stdio.old_stdout = dup( STDOUT_FILENO )) < 0 ) {
             fprintf(stderr, "Unable to duplicate STDOUT_FILENO\n");
             eval_error("Unable to duplicate STDOUT_FILENO");
             return -1;
         }
 
-        if ( close( STDOUT_FILENO )  < 0 ) {
-            eval_error("Unable to close STDOUT_FILENO");
-            return -1;
-        }
-
-        // Remove file if it exists
-        unlink( _fstdout );
-
-        if ( (_eval_stdio.stdout = open( _fstdout, O_CREAT | O_WRONLY )) < 0 ) {
+        int new_stdout;
+        if ( (new_stdout = open( _fstdout, O_CREAT | O_WRONLY | O_TRUNC, 0600 )) < 0 ) {
             fprintf(stderr, "Unable to open file %s as write-only\n", _fstdout);
             eval_error("Unable to open file %s as write-only", _fstdout);
             return -1;
         }
-        if ( (dup2( _eval_stdio.stdout, STDOUT_FILENO )) < 0 ) {
+
+        if ( (dup2( new_stdout, STDOUT_FILENO )) < 0 ) {
             fprintf(stderr, "Unable to associate file %s with stdout\n", _fstdout);
             eval_error("Unable to associate file %s with stdout", _fstdout);
             return -1;
         }
+
+        if ( close( new_stdout ) < 0 ) {
+            fprintf(stderr, "Unable to close new_stdout file descriptor\n");
+            return -1;
+        }
+
     } else {
-        _eval_stdio.stdout_old = -1;
-        _eval_stdio.stdout = -1;
+        _eval_stdio.old_stdout = -1;
     }
 
     return 0;
@@ -606,45 +606,38 @@ int _eval_io_redirect( const char* _fstdin, const char* _fstdout ) {
  */
 int _eval_io_restore( void ) {
 
-    if ( _eval_stdio.stdin != -1 ) {
-
-        if ( close( _eval_stdio.stdin ) < 0 ) {
-            fprintf(stderr, "Unable to close stdin file\n" );
-            return 1;
-        }
-        if ( dup2( _eval_stdio.stdin_old, STDIN_FILENO ) < 0 ) {
-            fprintf(stderr, "Unable to reassociate STDIN with console\n" );
-            return 1;
-        }
-
-        if ( close( _eval_stdio.stdin_old ) < 0 ) {
-            fprintf(stderr, "Unable to close stdin_old file\n" );
-            return 1;
-        }
-
-    }
-
-    if ( _eval_stdio.stdout != -1 ) {
+    if ( _eval_stdio.old_stdout != -1 ) {
 
         // Flush any remaining data to disk
         // If this is not done then this data will be sent to the next STDOUT device
         fflush( stdout );
 
-        if ( close( _eval_stdio.stdout ) < 0 ) {
-            fprintf(stderr, "Unable to close stdout file\n" );
-            return 1;
-        }
-
-        if ( dup2( _eval_stdio.stdout_old, STDOUT_FILENO ) < 0 ) {
+        if ( dup2( _eval_stdio.old_stdout, STDOUT_FILENO ) < 0 ) {
             fprintf(stderr, "Unable to reassociate STDOUT with console\n" );
-            return 1;
+            return -1;
         }
 
-        if ( close( _eval_stdio.stdout_old ) < 0 ) {
-            fprintf(stderr, "Unable to close stdin_old file\n" );
-            return 1;
+        if ( close( _eval_stdio.old_stdout ) < 0 ) {
+            fprintf(stderr, "Unable to close old_stdout file\n" );
+            return -1;
+        }
+    }
+
+    if ( _eval_stdio.old_stdin != -1 ) {
+
+        // Clear any remaining data on stdin
+        // If this is not done then it will remain in STDIN
+        fflush( stdin );
+
+        if ( dup2( _eval_stdio.old_stdin, STDIN_FILENO ) < 0 ) {
+            fprintf(stderr, "Unable to reassociate STDIN with console\n" );
+            return -1;
         }
 
+        if ( close( _eval_stdio.old_stdin ) < 0 ) {
+            fprintf(stderr, "Unable to close old_stdin file\n" );
+            return -1;
+        }
     }
 
     return 0;
@@ -655,10 +648,10 @@ int _eval_io_restore( void ) {
  * 
  * This value will be used to check if the test routine left any files open
  */
-void _eval_init_filemon( void ) {
+void _eval_init_filemon( void ) {    
     // Get the file descriptor value of a new file
     // All files opened from test code should have a descriptor >= than this
-    _eval_env.filemon = dup(STDIN_FILENO);
+    _eval_env.filemon = dup(STDERR_FILENO);
     close(_eval_env.filemon);
 }
 
@@ -3431,14 +3424,13 @@ void eval_reset_vars( void ) {
 /**
  * @brief Sets default values for evaluation variables
  * 
- * This sets the default behavior for all eval.c functions and clears all counters.
+ * This sets the default behavior for all eval.c functions.
  * 
  * Specifically:
  *  1 - Resets all _eval_*_data variables to 0, including the status and action fields
- *  2 - Resets all stats counters
- *  3 - Sets the timeout time to EVAL_TIMEOUT
- *  4 - Block execution of pause(), execl(), wait() and waitpid()
- *  5 - Prevent signals to self
+ *  2 - Sets the timeout time to EVAL_TIMEOUT
+ *  3 - Block execution of pause(), execl(), wait() and waitpid()
+ *  4 - Prevent signals to self
  */
 void eval_reset( void ) {
     // Reset all values
@@ -3458,6 +3450,4 @@ void eval_reset( void ) {
     _eval_raise_data.action = ACTION_BLOCK;
     _eval_kill_data.action = ACTION_PROTECT;
 
-    // Reset stats counters
-    eval_reset_stats();
 }

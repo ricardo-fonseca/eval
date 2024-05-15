@@ -11,7 +11,7 @@ The main features of the `eval` environment are:
 
 For more details on the features available in the toolkit be sure to check the [documentation](eval.md).
 
-The toolkit was initially developed for use in the "Operating Systems" course unit taught at [ISCTE - University Insitute of Lisbon](https://www.iscte-iul.pt), Portugal, for undergraduate computer science students.
+The toolkit was initially developed for use in the "Operating Systems" course unit taught at [ISCTE - University Insitute of Lisbon](https://www.iscte-iul.pt/school/8/escola-de-tecnologias-arquitetura), Portugal, for undergraduate computer science students.
 
 ## Documentation
 
