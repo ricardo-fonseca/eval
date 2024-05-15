@@ -2,7 +2,7 @@
  * @file eval.c
  * @author Ricardo Fonseca
  * @brief Toolkit for evaluating student code
- * @version 0.5.0
+ * @version 0.5.1
  * @date 2024-05-15
  * 
  * @copyright Copyright (C) 2024 Ricardo Fonseca
@@ -1264,6 +1264,11 @@ EVAL_VAR(sleep);
  * @return          Evalation result or result of sleep operation
  */
 unsigned int _eval_sleep(unsigned int seconds) {
+
+#ifdef _EVAL_DEBUG
+    printf( _EVAL_DEBUG_PREFIX "sleep( %d )\n", seconds );
+#endif
+
     _eval_sleep_data.status ++;
     _eval_sleep_data.seconds = seconds;
     switch( _eval_sleep_data.action ) {
@@ -1622,6 +1627,10 @@ EVAL_VAR(signal);
  * @return          Previous value of signal handler, SIG_ERR on error
  */
 sighandler_t _eval_signal(int signum, sighandler_t handler) {
+#ifdef _EVAL_DEBUG
+    printf( _EVAL_DEBUG_PREFIX "signal( %d, %p )\n", signum, (void *) handler );
+#endif
+
     _eval_signal_data.status ++;
     _eval_signal_data.signum = signum;
     _eval_signal_data.handler = handler;
@@ -2112,6 +2121,8 @@ ssize_t _eval_msgrcv(int msqid, void *msgp, size_t msgsz, long msgtyp, int msgfl
         _eval_msgrcv_data.msgtyp = msgtyp;
         _eval_msgrcv_data.msgflg = msgflg;
 
+        errno = ( _eval_msgrcv_data._errno ) ? _eval_msgrcv_data._errno : EINVAL;
+
         _eval_msgrcv_data.ret = -1;
         break;
 
@@ -2147,8 +2158,8 @@ ssize_t _eval_msgrcv(int msqid, void *msgp, size_t msgsz, long msgtyp, int msgfl
             _eval_msgrcv_data.ret = -1;
         }
     }
-    return _eval_msgrcv_data.ret;
 
+    return _eval_msgrcv_data.ret;
 }
 
 /**
@@ -2303,15 +2314,12 @@ EVAL_VAR(semctl);
  * + `ACTION_DEFAULT` - Capture parameters and call `semctl(semid,semnum,cmd,...)`
  * 
  * @param semid     semaphore id
- * @param sops      Semaphore operations
- * @param nsops     nsops
- * @return          semop result
+ * @param semnum    semaphore value index
+ * @param cmd       command
+ * @param ...       extra parameters
+ * @return          semctl result
  */
 int _eval_semctl(int semid, int semnum, int cmd, ... ) {
-
-#ifdef _EVAL_DEBUG
-    printf( _EVAL_DEBUG_PREFIX "semctl( %d, %d, %d, ... )\n", semid, semnum, cmd );
-#endif
 
     _eval_semctl_data.status ++;
 
@@ -2333,6 +2341,14 @@ int _eval_semctl(int semid, int semnum, int cmd, ... ) {
         }
     }
 
+#ifdef _EVAL_DEBUG
+    if (cmd == SETVAL) {
+        printf( _EVAL_DEBUG_PREFIX "semctl( %d, %d, %d, %d )\n", semid, semnum, cmd, _eval_semctl_data.arg.val );
+    } else {
+        printf( _EVAL_DEBUG_PREFIX "semctl( %d, %d, %d, ... )\n", semid, semnum, cmd );
+    }
+#endif
+
     switch (_eval_semctl_data.action) {
 
     case(ACTION_ERROR): // error
@@ -2340,7 +2356,11 @@ int _eval_semctl(int semid, int semnum, int cmd, ... ) {
         errno = EINVAL;
         break;
     case(ACTION_LOG): // log
-        datalog("semctl,%d,%d,%d", semid, semnum, cmd );
+        if ( cmd == SETVAL ) {
+            datalog("semctl,%d,%d,%d,%d", semid, semnum, cmd, _eval_semctl_data.arg, _eval_semctl_data.arg.val );
+        } else {
+            datalog("semctl,%d,%d,%d", semid, semnum, cmd );
+        }
     case(ACTION_SUCCESS): // success
         _eval_semctl_data.ret = 0;
         break;
@@ -2407,6 +2427,7 @@ int _eval_semop(int semid, struct sembuf *sops, size_t nsops) {
 
     _eval_semop_data.status ++;
 
+    _eval_semop_data.semid = semid;
     _eval_semop_data.sops = sops;
     _eval_semop_data.nsops = nsops;
 
@@ -2557,7 +2578,6 @@ void *_eval_shmat( int shmid, const void *shmaddr, int shmflg) {
 
     _eval_shmat_data.status ++;
     _eval_shmat_data.shmid = shmid;
-    _eval_shmat_data.shmaddr = (void *) shmaddr;
     _eval_shmat_data.shmflg = shmflg;
 
     switch( _eval_shmat_data.action ) {
@@ -2577,12 +2597,10 @@ void *_eval_shmat( int shmid, const void *shmaddr, int shmflg) {
         break;
 
     default:
-        _eval_shmat_data.shmid = shmid;
-        _eval_shmat_data.shmaddr = (void *) shmaddr;
-        _eval_shmat_data.shmflg = shmflg;
-
         _eval_shmat_data.ret = shmat( shmid, shmaddr, shmflg );
     }
+
+    _eval_shmat_data.shmaddr = (void *) shmaddr;
 
     return _eval_shmat_data.ret;
 }
@@ -3013,12 +3031,6 @@ int _eval_fclose( FILE* stream ) {
     _eval_fclose_data.ret = -1;
     _eval_fclose_data.stream = stream;
 
-    int err = 0;
-    if ( ! eval_checkptr( stream ) ) {
-        eval_error("fclose(stream) called with invalid stream");
-        err++;
-    }
-
     switch( _eval_fclose_data.action ) {
 
     case( ACTION_ERROR ): // error
@@ -3036,12 +3048,7 @@ int _eval_fclose( FILE* stream ) {
         break;
 
     default:
-        if ( ! err ) {
-            _eval_fclose_data.ret = fclose(stream);
-        } else {
-            _eval_fclose_data.ret = EOF;
-            errno = EINVAL;
-        }
+        _eval_fclose_data.ret = fclose(stream);
     }
 
     return _eval_fclose_data.ret;

@@ -581,7 +581,7 @@ The routine will check for an invalid `msgp` pointer and issue an error message 
 #### Function `_eval_msgrcv_data.action` options
 
 + `ACTION_INJECT`  - (inject) Copy data in `*_eval_msgsnd_data.msgp` to `*msgp`. The pointer `msgp` is checked before copying.
-+ `ACTION_ERROR`   - (error) Return -1
++ `ACTION_ERROR`   - (error) Return -1 and set `errno` to `_eval_msgrcv_data._errno` (or `EINVAL` if this value is 0)
 + `ACTION_LOG`     - (log) Log function call and proceed with `ACTION_SUCCESS`.
 + `ACTION_SUCCESS` - (success) Return `msgsz`.
 + `ACTION_DEFAULT` - Capture parameters and call `msgrcv( msqid, msgp, msgsz, msgtyp, msgflg )`
@@ -594,6 +594,7 @@ The routine will check for an invalid `msgp` pointer and issue an error message 
 + `.msgtyp`   - Value of the `msgtyp` parameter
 + `.msgsz`    - Value of the `msgsz` parameter
 + `.msgflg`   - Value of the `msgflg` parameter
++ `._errno`   - Error value to report for `ACTION_ERROR`
 
 ### msgctl(int msqid, int cmd, struct msqid_ds *buf)
 
@@ -806,8 +807,6 @@ __Note__: Since `atoi()` is unsafe, the routine will first check for a valid str
 + `.nptr`     - Copy of the value of the `nptr` parameter
 
 ### fclose( FILE \* stream )
-
-__Note__: The routine will first check for a valid pointer. If an error is found, the routine will issue an error message.
 
 #### Function `_eval_fclose_data.action` options
 

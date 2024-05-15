@@ -607,6 +607,8 @@ typedef struct {
     size_t msgsz;
     long msgtyp;
     int msgflg;
+
+    int _errno;
 } _eval_msgrcv_type;
 
 extern _eval_msgrcv_type _eval_msgrcv_data;
@@ -684,7 +686,7 @@ extern _eval_semctl_type _eval_semctl_data;
 
 int _eval_semctl(int semid, int semnum, int cmd, ... );
 
-#define semctl( semid, semnum, ... ) _eval_semctl( semid, semnum, ## __VA_ARGS__ )
+#define semctl( semid, ... ) _eval_semctl( semid, __VA_ARGS__ )
 
 /******************************************************************************
  * semop
